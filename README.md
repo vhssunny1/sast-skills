@@ -1,139 +1,140 @@
 # SAST Skills — LLM-Powered Static Analysis Pipeline
 
-An LLM-powered SAST pipeline built entirely as Claude Code slash commands. No compiled code, no agent framework — each capability is a prompt-driven skill that Claude executes when invoked as `/skill-name`.
+An LLM-powered SAST pipeline built entirely as Claude Code slash commands. No compiled code, no agent framework — each capability is a markdown skill that Claude executes when invoked as `/skill-name`.
 
-Validated against **DVJA** (Java/Struts2) and **Redash** (Python/Flask + TypeScript/React). The pipeline discovered two previously-unreported critical vulnerabilities in Redash, confirmed via DAST:
-
-| Finding | CWE | CVSS | Status |
-|---|---|---|---|
-| RestrictedPython sandbox escape (`python.py` `_getattr_ = getattr`) | CWE-94 | 9.9 Critical | DAST confirmed — `uid=1000(redash)` |
-| Auth bypass via unsigned `X-Forwarded-Remote-User` header | CWE-287 | 9.8 Critical | DAST confirmed — full admin session, zero credentials |
+Supports **Java**, **Python**, and **TypeScript/JavaScript** — including polyglot repos (e.g. Python backend + React frontend).
 
 ---
 
-## How It Works
+## Workflow
 
-Each skill is a markdown file in `.claude/commands/`. Claude Code reads it as a slash command and executes it against the target repo. Skills share state through files — no in-memory coupling.
-
-```
-/detect-language  → language-manifest.json    which skills to run
-/crawl-{lang}     → crawl-output.json         file roles, routes, security_priority
-/config-audit     → findings.json             dangerous defaults in .env / docker-compose
-/find-vulns-{lang}→ findings.json             semantic source → sink analysis
-/cross-lang-taint → findings.json             Python store → TypeScript render XSS (polyglot)
-/taint-trace      → findings.json             cross-file path verification
-/validate-findings→ findings.json             FP scoring + ranking
-/scan-report      → scan-results.sarif        SARIF 2.1.0 for IDE / GitHub
-                    scan-summary.md           human-readable report
-/scan-metrics     → sast-metrics.json         append-only history
-/generate-fix     → diff + explanation        per finding, on demand
-```
-
-Run everything at once:
+Skills run sequentially. Each writes a file consumed by the next.
 
 ```
-/sast-full-scan <repo-path> [--ground-truth <path>]
+/detect-language   → language-manifest.json    detects language, selects pipeline skills
+/crawl-{lang}      → crawl-output.json         maps files by role, routes, security priority
+/config-audit      → findings.json             dangerous defaults in .env / docker-compose
+/find-vulns-{lang} → findings.json             semantic source → sink analysis
+/cross-lang-taint  → findings.json             cross-language taint (polyglot repos only)
+/taint-trace       → findings.json             cross-file path verification
+/validate-findings → findings.json             FP scoring + ranking
+/scan-report       → scan-results.sarif        SARIF 2.1.0 for IDE / GitHub Security tab
+                     scan-summary.md           human-readable report with fix hints
+/scan-metrics      → sast-metrics.json         append-only run history
+/generate-fix      → unified diff              per finding, on demand
+```
+
+Run the full pipeline in one command:
+
+```
+/sast-full-scan <repo-path>
 ```
 
 ---
 
-## Skills
-
-### Pipeline
-
-| Skill | What it does |
-|---|---|
-| `detect-language` | Counts source files by extension, detects framework (Spring/Flask/Next.js/etc.), writes routing manifest for the pipeline |
-| `sast-full-scan` | Orchestrator — chains all steps in order, writes intermediate snapshots to `sast-runs/<timestamp>/`. Flags: `--ground-truth`, `--skip-taint`, `--skip-config-audit` |
-
-### Crawl — Attack Surface Mapping
-
-| Skill | Language | What it classifies |
-|---|---|---|
-| `crawl` / `crawl-java` | Java | Entry points, routes, Spring/Struts/JAX-RS detection, dependency flags |
-| `crawl-python` | Python | Flask/FastAPI/Django routes; `async_worker` role covers Celery, RQ, Dramatiq, Huey; `security_priority` score (1–5) per file; reads `.env` + `docker-compose` for dangerous defaults |
-| `crawl-typescript` | TypeScript / JS | React/Next.js/Express routes; `security_priority` per file |
-
-### Find Vulnerabilities — Semantic Source→Sink Reasoning
-
-| Skill | Language | Key sinks covered |
-|---|---|---|
-| `find-vulns` / `find-vulns-java` | Java | SQL injection, command injection, XSS in JSP, IDOR, unvalidated redirect, weak crypto, insecure deserialization |
-| `find-vulns-python` | Python | Command injection, **sandbox escape** (RestrictedPython `_getattr_` guard bypass), SSRF, path traversal, **env-gated auth bypass** (`condition` field), async queue taint, security library trust model check (Q6) |
-| `find-vulns-typescript` | TypeScript / JS | DOM XSS, `dangerouslySetInnerHTML`, **Leaflet / Mapbox popup HTML injection**, open redirect, prototype pollution, SSRF, hardcoded secrets |
-| `config-audit` | Any | `.env` feature flags enabled in dangerous modes, weak / default secrets, backend ports exposed past reverse proxy, debug mode, CSRF disabled |
-| `cross-language-taint` | Python + TypeScript | Stored-XSS paths where Python backend writes user data → TypeScript renders it via `bindPopup()` / `innerHTML` without sanitization |
-
-### Taint Tracing & Validation
-
-| Skill | What it adds to `findings.json` |
-|---|---|
-| `taint-trace` | `taint_path[]` — hop-by-hop chain from entry point to sink. Handles async queue hops (`role: async_queue`) and feature-flag conditional guards (`conditional_protection`). Sets `taint_confirmed: true/false/null`. |
-| `validate-findings` | `fp_score` (0.0 real → 1.0 false positive) and `validation_status`: `confirmed` / `likely_real` / `needs_review` / `likely_fp` |
-
-### Reporting & Fixes
-
-| Skill | Output |
-|---|---|
-| `scan-report` | `scan-results.sarif` (SARIF 2.1.0 for GitHub / VS Code) + `scan-summary.md`. Computes precision/recall when `--ground-truth` is provided. |
-| `generate-fix` | Unified diff + explanation + test cases for a single finding ID |
-| `scan-metrics` | Appends run stats to `sast-metrics.json` for trend tracking across scans |
-
-### Focused Hunt Skills (standalone, no crawl required)
-
-| Skill | Focus |
-|---|---|
-| `auth-audit` | Authentication and authorization checks — header-based identity, missing ownership checks, insecure session handling |
-| `cmd-injection` | Deep scan for command injection — `subprocess`, `os.system`, `Runtime.exec()`, shell=True |
-| `ssrf-hunt` | SSRF sinks — `requests.get(url)`, `fetch(url)`, `Repo.clone_from(url)` with unvalidated URLs |
-| `path-traversal` | File path construction from user input without `resolve()` + `relative_to()` guard |
-| `sandbox-escape` | Restricted execution context bypasses — `exec()` with weakened guards, `RestrictedPython` guard overrides |
-| `frontend-hunt` | TypeScript/React XSS — `innerHTML`, `dangerouslySetInnerHTML`, map popup sinks, `postMessage` |
-| `waf-bypass` | Encoding and evasion patterns that bypass WAF rules |
-
----
-
-## Design Principles
-
-**Read the code, not a checklist.** `find-vulns-*` skills derive findings by following data flow from source to sink in the actual code. They never consult CVE databases, ground truth files, or prior knowledge of the target repo. Every finding cites the verbatim line of evidence.
-
-**Security library trust model.** When a security library is present, verify the implementation honours *all* of its documented trust assumptions — not just that it is imported. RestrictedPython requires `_getattr_ = safe_getattr`; if the code sets `_getattr_ = getattr` (real builtin), the sandbox is nullified. The skill reads the guard installation, not the import line.
-
-**Feature-flag gated vulnerabilities are still vulnerabilities.** Code paths only exploitable when an env var is set (e.g. `REMOTE_USER_LOGIN_ENABLED=true`) are reported as conditional findings with a `condition` field. The flag scopes *when* they are exploitable — not whether the code is vulnerable.
-
-**Taint crosses process and language boundaries.**
-- Async queue: `entry_point → queue.enqueue(tainted) → worker → sink` crosses a Redis/RabbitMQ boundary. `taint-trace` marks the broker hop explicitly.
-- Cross-language: Python stores user data in DB → TypeScript renders it in Leaflet popup → stored XSS. `cross-language-taint` matches both sides.
-
----
-
-## Requirements
-
-- **Claude Code** — [claude.ai/code](https://claude.ai/code)
-- A `.git` directory at the project root (Claude Code discovers slash commands by looking for `.claude/commands/` inside a git repo)
-- Point skills at your target repo — the skills themselves live here, the repo being scanned is a separate directory
-
----
-
-## Usage Example
+## Usage
 
 ```bash
 # Clone this repo
 git clone https://github.com/vhssunny1/sast-skills.git
 cd sast-skills
 
-# Open Claude Code, then scan any repo
+# Open Claude Code, then point at any target repo
 /sast-full-scan /path/to/target-repo
 
-# With precision/recall measurement (requires a ground-truth file)
+# With precision/recall measurement
 /sast-full-scan /path/to/target-repo --ground-truth /path/to/ground-truth.md
+
+# Skip taint trace for a faster pass
+/sast-full-scan /path/to/target-repo --skip-taint
 
 # Run individual skills
 /detect-language /path/to/target-repo
 /crawl-python /path/to/target-repo
+/crawl-typescript /path/to/target-repo
+/config-audit /path/to/target-repo
 /find-vulns-python --crawl crawl-output.json
+/find-vulns-typescript --crawl crawl-output.json
 /taint-trace --findings findings.json --crawl crawl-output.json
-/validate-findings
+/validate-findings --findings findings.json
 /scan-report --findings findings.json
 /generate-fix FINDING-001
 ```
+
+---
+
+## Skills
+
+### Orchestration
+
+| Skill | Purpose |
+|---|---|
+| `detect-language` | Counts source files by extension, detects framework, writes routing manifest that tells `sast-full-scan` which crawl and find-vulns skills to run |
+| `sast-full-scan` | Chains all pipeline steps in order. Writes intermediate snapshots to `sast-runs/<timestamp>/`. Options: `--ground-truth`, `--skip-taint`, `--skip-config-audit` |
+
+### Crawl — Attack Surface Mapping
+
+| Skill | Language | What it produces |
+|---|---|---|
+| `crawl` / `crawl-java` | Java | File roles, HTTP routes, Spring/Struts/JAX-RS framework detection, flagged dependencies |
+| `crawl-python` | Python | File roles, Flask/FastAPI/Django routes, `async_worker` classification (Celery, RQ, Dramatiq, Huey), `security_priority` score per file, config file warnings |
+| `crawl-typescript` | TypeScript / JS | File roles, React/Next.js/Express routes, `security_priority` score per file |
+
+### Find Vulnerabilities
+
+| Skill | Language | Vulnerability classes |
+|---|---|---|
+| `find-vulns` / `find-vulns-java` | Java | SQL injection, command injection, XSS, IDOR, open redirect, weak crypto, insecure deserialization, sensitive data in logs |
+| `find-vulns-python` | Python | Command injection, code injection, sandbox escape, SSRF, path traversal, insecure deserialization, auth bypass, async queue taint, env-gated conditional findings |
+| `find-vulns-typescript` | TypeScript / JS | DOM XSS, React XSS, mapping library popup injection, open redirect, SSRF, prototype pollution, hardcoded secrets |
+| `config-audit` | Any | Dangerous feature flags, weak or default secrets, backend ports exposed past a reverse proxy, debug mode, disabled security middleware |
+| `cross-language-taint` | Python + TypeScript | Stored-XSS paths where backend writes user data to DB and frontend renders it as raw HTML |
+
+### Taint Tracing & Validation
+
+| Skill | What it adds |
+|---|---|
+| `taint-trace` | Hop-by-hop taint path from entry point to sink across file boundaries. Handles async queue hops and feature-flag conditional guards. Sets `taint_confirmed`, `taint_path[]`, `conditional_protection`. |
+| `validate-findings` | FP scoring rubric (`fp_score` 0.0–1.0) and `validation_status`: `confirmed` / `likely_real` / `needs_review` / `likely_fp`. Deduplicates and ranks. |
+
+### Reporting & Fixes
+
+| Skill | Output |
+|---|---|
+| `scan-report` | `scan-results.sarif` (SARIF 2.1.0) + `scan-summary.md`. Computes precision/recall when `--ground-truth` is provided. |
+| `generate-fix` | Unified diff + explanation + test cases for one finding |
+| `scan-metrics` | Appends run metrics to `sast-metrics.json` for trend tracking |
+
+### Focused Hunt Skills — Standalone
+
+Run these directly on a repo without going through the full pipeline.
+
+| Skill | Focus |
+|---|---|
+| `auth-audit` | Authentication and authorization — header-based identity, missing ownership checks, insecure sessions |
+| `cmd-injection` | Command injection sinks — `subprocess`, `os.system`, `Runtime.exec()`, `shell=True` |
+| `ssrf-hunt` | SSRF sinks — outbound HTTP with unvalidated URLs, Git clone from user-supplied URL |
+| `path-traversal` | File path construction from user input without containment guard |
+| `sandbox-escape` | Restricted execution context bypasses — weakened guards in `exec()` environments |
+| `frontend-hunt` | TypeScript/React client-side injection — `innerHTML`, `dangerouslySetInnerHTML`, map popups, `postMessage` |
+| `waf-bypass` | Encoding and evasion patterns that bypass WAF rules |
+
+---
+
+## Design Principles
+
+**Read the code, not a checklist.** Every finding is derived from tracing actual data flow in the code being scanned. No CVE lookups, no pattern tables, no prior knowledge of the target. The `evidence` field in every finding is the verbatim line from the source file.
+
+**Security library trust model.** When a security library is used, verify the implementation honours all of its documented trust assumptions — not just that the library is imported. A library that requires specific guards or hooks provides no protection if those guards are replaced with unsafe equivalents.
+
+**Feature-flag gated vulnerabilities are still vulnerabilities.** Code paths gated behind an env var or config flag are reported as conditional findings with a `condition` field. The flag controls when the path is exploitable, not whether the code is vulnerable.
+
+**Taint crosses process and language boundaries.** The pipeline tracks taint across async queue hops (Celery, RQ) and across the Python→TypeScript boundary (stored data rendered as HTML). Single-language scanners miss both of these paths.
+
+---
+
+## Requirements
+
+- [Claude Code](https://claude.ai/code)
+- A `.git` directory at the project root — Claude Code discovers slash commands by scanning for `.claude/commands/` inside a git repo
+- The skills live in this repo; the repo being scanned is a separate directory you pass as an argument
