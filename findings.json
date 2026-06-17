@@ -1,0 +1,217 @@
+{
+  "scanned_at": "2026-06-17T13:30:00Z",
+  "repo_path": "c:/Users/Harikrishna_Valugond/SAST/redash",
+  "languages": ["python", "typescript"],
+  "framework": { "python": "flask", "typescript": "react" },
+  "total_findings": 6,
+  "findings_by_severity": { "critical": 0, "high": 3, "medium": 2, "low": 1 },
+  "validation_summary": {
+    "total_before_dedup": 6,
+    "duplicates_removed": 0,
+    "total_after_dedup": 6,
+    "confirmed": 4,
+    "likely_real": 1,
+    "needs_review": 0,
+    "likely_fp": 1,
+    "estimated_precision": 0.83
+  },
+  "findings": [
+    {
+      "id": "PY-001",
+      "cwe": "CWE-94",
+      "owasp": "A03:2021",
+      "severity": "high",
+      "confidence": 0.87,
+      "file": "redash/query_runner/python.py",
+      "line": 318,
+      "method": "run_query",
+      "source": "query — user-submitted Python code via POST /api/query_results to any Python data source",
+      "sink": "exec(code, restricted_globals, self._script_locals) at line 357 — RestrictedPython-compiled bytecode executed with sandbox guard disabled",
+      "sanitization_present": "compile_restricted() transforms source to bytecode, but _getattr_ override at line 318 removes the primary attribute-access guard",
+      "evidence": "builtins[\"_getattr_\"] = getattr",
+      "description": "RestrictedPython's safety depends on _getattr_ being a guarded function that blocks dunder attribute access. With real getattr assigned, an attacker can traverse the class hierarchy: getattr(getattr('', '__class__'), '__mro__')[-1].__subclasses__() to find subprocess.Popen and execute OS commands. setattr is also exposed (line 319). Any authenticated user with execute access to a Python data source can escape the sandbox.",
+      "fix_hint": "from RestrictedPython.Guards import safe_getattr; builtins['_getattr_'] = safe_getattr",
+      "taint_confirmed": true,
+      "confidence_after_trace": 0.87,
+      "taint_path": [
+        {"step": 1, "file": "redash/handlers/query_results.py", "method": "QueryResultListResource.post", "note": "SOURCE — params['query'] from POST /api/query_results JSON body"},
+        {"step": 2, "file": "redash/tasks/queries/execution.py", "method": "enqueue_query", "note": "query_text passed to Celery worker"},
+        {"step": 3, "file": "redash/query_runner/python.py", "method": "run_query", "note": "SINK — compile_restricted(query) then exec() with _getattr_ = real getattr"}
+      ],
+      "sanitization_gaps": [
+        "_getattr_ overridden with real getattr — dunder attribute access unrestricted",
+        "setattr exposed directly — object mutation unrestricted"
+      ],
+      "fp_score": 0.13,
+      "validation_status": "confirmed"
+    },
+    {
+      "id": "PY-002",
+      "cwe": "CWE-78",
+      "owasp": "A03:2021",
+      "severity": "high",
+      "confidence": 0.90,
+      "file": "redash/query_runner/script.py",
+      "line": 19,
+      "method": "run_script",
+      "source": "query — user-submitted command text via POST /api/query_results to any Script data source",
+      "sink": "subprocess.check_output(script, shell=shell) — OS command execution with user-controlled command",
+      "sanitization_present": "when path='*': none. The '../' check (line 64) applies only to the path config value, not to query content",
+      "evidence": "output = subprocess.check_output(script, shell=shell)",
+      "description": "When Script data source is configured with path='*', query_to_script_path() returns the raw query string as the command (return query at line 15). subprocess.check_output(query, shell=True) then executes any shell command. The class type is 'insecure_script' acknowledging the danger, but any user with access to this data source gains OS command execution.",
+      "fix_hint": "Remove path='*' support. Always enforce shell=False and resolve scripts against the configured path directory.",
+      "taint_confirmed": true,
+      "confidence_after_trace": 0.90,
+      "taint_path": [
+        {"step": 1, "file": "redash/handlers/query_results.py", "method": "QueryResultListResource.post", "note": "SOURCE — params['query'] from POST body"},
+        {"step": 2, "file": "redash/query_runner/script.py", "method": "run_query", "note": "query_to_script_path(path='*', query) returns query unchanged"},
+        {"step": 3, "file": "redash/query_runner/script.py", "method": "run_script", "note": "SINK — subprocess.check_output(script=query, shell=True)"}
+      ],
+      "sanitization_gaps": [
+        "path='*' bypasses directory restriction entirely",
+        "shell=True allows shell metacharacters"
+      ],
+      "fp_score": 0.10,
+      "validation_status": "confirmed"
+    },
+    {
+      "id": "PY-003",
+      "cwe": "CWE-918",
+      "owasp": "A10:2021",
+      "severity": "medium",
+      "confidence": 0.73,
+      "confidence_note": "advocate SSRF protection is ON by default; exploitable only when REDASH_ENFORCE_PRIVATE_IP_BLOCK=false",
+      "file": "redash/query_runner/json_ds.py",
+      "line": 197,
+      "method": "_get_all_results",
+      "source": "query['url'] — URL field from YAML query body, user-supplied",
+      "sink": "requests_session.request(method, url) via BaseHTTPQueryRunner.get_response() — conditional advocate/requests import",
+      "sanitization_present": "advocate library blocks private IPs when ENFORCE_PRIVATE_ADDRESS_BLOCK=True (default). Plain requests used when False.",
+      "evidence": "results, error = self._get_all_results(query[\"url\"], method, path, pagination, **request_options)",
+      "description": "JSON query runner fetches user-supplied URLs. SSRF protection depends entirely on ENFORCE_PRIVATE_ADDRESS_BLOCK env var. Deployments that set REDASH_ENFORCE_PRIVATE_IP_BLOCK=false lose all SSRF protection. Additionally, user-controlled headers (query['headers']) and auth credentials allow header injection alongside SSRF. Advocate may not cover IPv6 or DNS-rebinding edge cases.",
+      "fix_hint": "Make advocate non-optional. Replace conditional import pattern with always-on advocate. Handle any private IP exceptions as per-data-source allowlists rather than a global off switch.",
+      "taint_confirmed": true,
+      "confidence_after_trace": 0.73,
+      "taint_path": [
+        {"step": 1, "file": "redash/handlers/query_results.py", "method": "QueryResultListResource.post", "note": "SOURCE — params['query'] from POST body"},
+        {"step": 2, "file": "redash/query_runner/json_ds.py", "method": "run_query", "note": "yaml.safe_load(query) → query['url'] extracted"},
+        {"step": 3, "file": "redash/query_runner/__init__.py", "method": "BaseHTTPQueryRunner.get_response", "note": "SINK — requests_session.request(url) using advocate or plain requests"}
+      ],
+      "sanitization_gaps": [
+        "SSRF protection is opt-out — one env var removes all protection",
+        "User-controlled headers field allows HTTP header injection"
+      ],
+      "fp_score": 0.27,
+      "validation_status": "likely_real"
+    },
+    {
+      "id": "PY-004",
+      "cwe": "CWE-287",
+      "owasp": "A01:2021",
+      "severity": "high",
+      "confidence": 0.92,
+      "confidence_note": "Feature is disabled by default (REMOTE_USER_LOGIN_ENABLED=false). Exploitable only when enabled.",
+      "file": "redash/authentication/remote_user_auth.py",
+      "line": 28,
+      "method": "login",
+      "source": "request.headers.get(settings.REMOTE_USER_HEADER) — X-Forwarded-Remote-User header, attacker-controlled if backend is directly reachable",
+      "sink": "create_and_login_user(current_org, email, email) — creates and authenticates session for header-provided email",
+      "sanitization_present": "REMOTE_USER_LOGIN_ENABLED setting check (defaults False). No header signature verification.",
+      "evidence": "email = request.headers.get(settings.REMOTE_USER_HEADER)",
+      "description": "When REMOTE_USER_LOGIN_ENABLED=true, any HTTP request to /remote_user/login with X-Forwarded-Remote-User header creates and logs in a Redash user with that email — including admin accounts. No token or signature validates the header. Code comments acknowledge this is 'potentially dangerous'. Deployments with exposed backend ports (misconfigured Docker, cloud security groups) allow full auth bypass.",
+      "fix_hint": "Add HMAC signature verification between proxy and Redash instead of trusting a plain HTTP header. Or replace with OAuth/SAML.",
+      "taint_confirmed": true,
+      "confidence_after_trace": 0.92,
+      "taint_path": [
+        {"step": 1, "file": "redash/authentication/remote_user_auth.py", "method": "login", "note": "SOURCE — email = request.headers.get('X-Forwarded-Remote-User')"},
+        {"step": 2, "file": "redash/authentication/__init__.py", "method": "create_and_login_user", "note": "SINK — user created or fetched by email, Flask-Login session established"}
+      ],
+      "sanitization_gaps": [
+        "No signature or HMAC on header value",
+        "No IP restriction on which hosts can submit this header",
+        "Email not validated beyond None check"
+      ],
+      "fp_score": 0.08,
+      "validation_status": "confirmed"
+    },
+    {
+      "id": "TS-001",
+      "cwe": "CWE-79",
+      "owasp": "A03:2021",
+      "severity": "medium",
+      "confidence": 0.77,
+      "confidence_note": "Requires query result column to contain HTML/script injection; consistent with data sourced from external systems or user-supplied database content",
+      "file": "viz-lib/src/visualizations/map/initMap.ts",
+      "line": 147,
+      "method": "initMap (row loop, default popup branch)",
+      "source": "v — column values from query result rows, sourced from any data source configured in Redash",
+      "sink": "marker.bindPopup(html_string) — Leaflet sets innerHTML on the popup element; unsanitized template literal containing v",
+      "sanitization_present": "sanitize() from DOMPurify is imported and used for custom popup templates (line 144). The DEFAULT popup branch (no template configured) skips sanitize(). This is an inconsistency within the same file.",
+      "evidence": "${map(row, (v, k) => `<li>${k}: ${v}</li>`).join(\"\")}",
+      "description": "When a map visualization has no custom popup template configured, each marker's popup is built from a template literal that injects column values (v) directly. Leaflet's bindPopup() accepts HTML strings and sets innerHTML internally. If any data column contains HTML or script payloads — which can come from user-editable fields in any connected database — that content executes when a user clicks the marker. Compare with lines 134/144: the custom-template path correctly wraps formatSimpleTemplate output in sanitize() before bindPopup. The default path lacks this.",
+      "fix_hint": "Wrap the default popup template literal in sanitize(): marker.bindPopup(sanitize(`<ul>...${map(row, (v, k) => `<li>${escapeHtml(k)}: ${escapeHtml(String(v))}</li>`).join('')}</ul>`))",
+      "taint_confirmed": true,
+      "confidence_after_trace": 0.77,
+      "taint_path": [
+        {"step": 1, "file": "viz-lib/src/visualizations/map/initMap.ts", "method": "initMap", "note": "SOURCE — row = individual query result object; v = column value from DB row"},
+        {"step": 2, "file": "viz-lib/src/visualizations/map/initMap.ts", "method": "initMap (line 147)", "note": "SINK — marker.bindPopup(template literal with ${v}) — Leaflet sets innerHTML on popup element"}
+      ],
+      "sanitization_gaps": [
+        "Default popup branch skips sanitize() that IS applied on the custom-template branch (lines 134, 144)",
+        "Column key k also unsanitized, though k is defined by the query author (lower risk)"
+      ],
+      "fp_score": 0.23,
+      "validation_status": "confirmed"
+    },
+    {
+      "id": "TS-002",
+      "cwe": "CWE-346",
+      "owasp": "A07:2021",
+      "severity": "low",
+      "confidence": 0.70,
+      "confidence_note": "Requires attacker to hold a window reference to the victim's Redash session AND the session restore modal to be active simultaneously",
+      "file": "client/app/services/restoreSession.jsx",
+      "line": 61,
+      "method": "showRestoreSessionPrompt (handlePostMessage)",
+      "source": "event — MessageEvent from any origin received by window.addEventListener('message', ...)",
+      "sink": "closeModal() + onSuccess() — called when event.data.type matches SESSION_RESTORED_MESSAGE, without origin check",
+      "sanitization_present": "event.data.type is compared to 'redash_session_restored'. No event.origin validation.",
+      "evidence": "window.addEventListener(\"message\", handlePostMessage, false);",
+      "description": "The session restore handler listens for postMessage events from any origin and does not validate event.origin before acting. An attacker with a window reference to the Redash app (e.g. via window.open()) can send {type: 'redash_session_restored'} causing the session restore modal to dismiss and triggering the session-restored callback. This causes the axios interceptor to retry failed requests without actual authentication, potentially looping until a real session restore occurs. Impact is limited to UX disruption / session logic confusion rather than data exfiltration.",
+      "fix_hint": "Add origin check: if (event.origin !== window.location.origin) return; inside handlePostMessage before checking event.data.type.",
+      "taint_confirmed": false,
+      "confidence_after_trace": 0.70,
+      "taint_path": [
+        {"step": 1, "file": "client/app/services/restoreSession.jsx", "method": "showRestoreSessionPrompt", "note": "SOURCE — window.addEventListener listens for MessageEvent from any origin; no event.origin check"},
+        {"step": 2, "file": "client/app/services/restoreSession.jsx", "method": "handlePostMessage", "note": "SINK — closeModal() and onSuccess() called on type match without origin validation"}
+      ],
+      "sanitization_gaps": [
+        "event.origin not checked before acting on postMessage content"
+      ],
+      "fp_score": 0.30,
+      "validation_status": "likely_real"
+    }
+  ],
+  "skipped_files": [
+    {"path": "redash/query_runner/pg.py", "reason": "Standard psycopg2 with parameterized queries"},
+    {"path": "redash/query_runner/mysql.py", "reason": "Standard MySQL connector with parameterized queries"},
+    {"path": "client/app/__tests__/", "reason": "test files excluded"},
+    {"path": "migrations/", "reason": "DB migration scripts"}
+  ],
+  "security_positive_signals": [
+    "DOMPurify present and used correctly via HtmlContent wrapper for all dangerouslySetInnerHTML",
+    "Markdown rendering (markdown.toHTML) always passes through DOMPurify",
+    "CSRF token properly configured in axios (xsrfCookieName + xsrfHeaderName)",
+    "Leaflet custom popup/tooltip templates DO use sanitize()",
+    "Open redirect mitigated server-side by get_next_path() stripping scheme and netloc",
+    "LDAP injection mitigated by escape_filter_chars(username)",
+    "YAML parsed with yaml.safe_load (not unsafe yaml.load)",
+    "eval() not found in client JS/TS code",
+    "postMessage TO parent uses window.location.origin (not '*')"
+  ],
+  "warnings": [
+    "70+ Python query_runner files not individually read — spot-checked pg.py and mysql.py for SQL injection",
+    "RestrictedPython sandbox escape (PY-001) full exploit chain requires RestrictedPython version awareness",
+    "viz-lib coverage: 463 TS/JS files; security-critical files prioritized"
+  ]
+}

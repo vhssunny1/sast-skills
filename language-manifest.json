@@ -1,0 +1,33 @@
+{
+  "repo_path": "c:/Users/Harikrishna_Valugond/SAST/redash",
+  "detected_at": "2026-06-17T00:00:00Z",
+  "file_counts": {
+    ".py": 290,
+    ".ts": 85,
+    ".tsx": 117,
+    ".js": 187,
+    ".jsx": 180,
+    ".java": 0,
+    ".go": 0
+  },
+  "languages": ["typescript", "python"],
+  "primary_language": "typescript",
+  "polyglot": true,
+  "frameworks": {
+    "python": "flask",
+    "typescript": "react"
+  },
+  "config_files_found": ["pyproject.toml", "package.json"],
+  "security_notable_deps": {
+    "python": ["flask", "flask-sqlalchemy", "pyjwt", "pysaml2", "authlib", "psycopg2-binary", "advocate"],
+    "typescript": ["react", "axios", "dompurify", "antd"]
+  },
+  "pipeline": {
+    "crawl": ["crawl-python", "crawl-typescript"],
+    "find_vulns": ["find-vulns-python", "find-vulns-typescript"]
+  },
+  "warnings": [
+    "180 .jsx + 187 .js files — JavaScript React components included under crawl-typescript / find-vulns-typescript",
+    "advocate library detected in Python deps — may be SSRF mitigation wrapper around requests (verify coverage during find-vulns-python)"
+  ]
+}

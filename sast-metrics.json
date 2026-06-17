@@ -1,0 +1,174 @@
+{
+  "runs": [
+    {
+      "run_id": "20260608-000000",
+      "run_date": "2026-06-08T00:00:00Z",
+      "repo": "c:/Users/Harikrishna_Valugond/SAST/dvja",
+      "framework": "struts2",
+      "java_version": "1.7",
+
+      "pipeline_metrics": {
+        "files_crawled": 21,
+        "entry_points": 11,
+        "routes_mapped": 14,
+        "dependencies_detected": 18,
+        "java_files": 21,
+        "jsp_files_scanned": 1,
+        "xml_configs_scanned": 1
+      },
+
+      "finding_metrics": {
+        "raw_findings_from_find_vulns": 13,
+        "after_taint_trace": 13,
+        "after_validate_findings": 13,
+        "duplicates_removed": 0,
+        "attrition_rate": 0.0,
+        "by_severity": {
+          "critical": 4,
+          "high": 6,
+          "medium": 3,
+          "low": 0
+        },
+        "by_cwe": {
+          "CWE-78": 1,
+          "CWE-89": 2,
+          "CWE-285": 1,
+          "CWE-916": 1,
+          "CWE-340": 1,
+          "CWE-532": 1,
+          "CWE-639": 1,
+          "CWE-601": 1,
+          "CWE-209": 1,
+          "CWE-79": 2,
+          "CWE-476": 1
+        },
+        "by_owasp": {
+          "A01:2021": 4,
+          "A02:2021": 1,
+          "A03:2021": 5,
+          "A05:2021": 2,
+          "A07:2021": 1,
+          "A09:2021": 1
+        }
+      },
+
+      "taint_metrics": {
+        "total_traced": 13,
+        "taint_confirmed": 13,
+        "taint_denied": 0,
+        "taint_partial": 0,
+        "taint_unreachable": 0,
+        "taint_confirmation_rate": 1.0,
+        "avg_confidence_before_trace": 0.913,
+        "avg_confidence_after_trace": 0.942,
+        "avg_taint_path_depth": 1.77,
+        "cross_file_findings": 7,
+        "single_file_findings": 6
+      },
+
+      "validation_metrics": {
+        "confirmed": 13,
+        "likely_real": 0,
+        "needs_review": 0,
+        "likely_fp": 0,
+        "avg_fp_score": 0.0,
+        "estimated_precision_taint_based": 1.00
+      },
+
+      "ground_truth_metrics": {
+        "ground_truth_total": 12,
+        "statically_detectable": 10,
+        "partial_detectability": 1,
+        "low_detectability": 1,
+
+        "true_positives": 11,
+        "false_positives": 2,
+        "false_negatives": 2,
+
+        "precision": 0.846,
+        "recall_all_gt": 0.833,
+        "recall_statically_detectable": 0.900,
+        "recall_including_partial": 0.909,
+        "f1_score": 0.840,
+
+        "tp_mapping": [
+          { "finding": "FINDING-001", "gt": "GT-02", "cwe": "CWE-78", "file": "PingAction.java" },
+          { "finding": "FINDING-002", "gt": "GT-01", "cwe": "CWE-89", "file": "UserService.java" },
+          { "finding": "FINDING-004", "gt": "GT-10", "cwe": "CWE-285", "file": "ApiAction.java" },
+          { "finding": "FINDING-005", "gt": "GT-04", "cwe": "CWE-916", "file": "UserService.java" },
+          { "finding": "FINDING-007", "gt": "GT-09", "cwe": "CWE-532", "file": "UserService.java" },
+          { "finding": "FINDING-008", "gt": "GT-07", "cwe": "CWE-639", "file": "UserAction.java" },
+          { "finding": "FINDING-009", "gt": "GT-12", "cwe": "CWE-601", "file": "RedirectAction.java" },
+          { "finding": "FINDING-010", "gt": "GT-08", "cwe": "CWE-209", "file": "struts.xml" },
+          { "finding": "FINDING-011", "gt": "GT-05", "cwe": "CWE-79", "file": "ProductList.jsp", "note": "GT basename=listProduct.jsp; scanned file=ProductList.jsp — same file, different naming" },
+          { "finding": "FINDING-012", "gt": "GT-06", "cwe": "CWE-79", "file": "ProductList.jsp", "note": "GT basename=listProduct.jsp; scanned file=ProductList.jsp — same file, different naming" },
+          { "finding": "FINDING-013", "gt": "GT-08", "cwe": "CWE-476", "file": "ApiAction.java", "note": "GT-08 covers both CWE-209 and CWE-476" }
+        ],
+        "false_positives_detail": [
+          {
+            "finding": "FINDING-003",
+            "cwe": "CWE-89",
+            "file": "ProductService.java",
+            "reason": "Real JPQL injection confirmed by taint trace; not documented in ground truth (GT-01 only covers UserService.java). This is a GT omission, not a scanner error."
+          },
+          {
+            "finding": "FINDING-006",
+            "cwe": "CWE-340",
+            "file": "UserService.java",
+            "reason": "Conceptually matches GT-03 (predictable reset token) but GT-03 uses CWE-640 and points to ResetPassword.java. Scanner correctly identified the token computation logic in UserService.java with CWE-340. CWE/file assignment difference."
+          }
+        ],
+        "false_negatives_detail": [
+          {
+            "gt": "GT-03",
+            "cwe": "CWE-640",
+            "file": "ResetPassword.java",
+            "reason": "Detected as FINDING-006 but assigned CWE-340 (Predictable Number) to UserService.java rather than CWE-640 (Weak Password Recovery) to ResetPassword.java. Underlying vulnerability correctly detected; CWE/file classification differs from GT."
+          },
+          {
+            "gt": "GT-11",
+            "cwe": "CWE-352",
+            "file": "addEditProduct form",
+            "reason": "CSRF not detected — requires checking Struts2 token interceptor configuration, not readable from Java/JSP code. Documented as low static detectability in ground truth."
+          }
+        ]
+      },
+
+      "coverage_metrics": {
+        "total_files": 21,
+        "files_with_findings": 8,
+        "coverage_pct": 0.381,
+        "files_without_findings": [
+          "src/main/java/com/appsecco/dvja/controllers/BaseController.java",
+          "src/main/java/com/appsecco/dvja/controllers/Home.java",
+          "src/main/java/com/appsecco/dvja/controllers/Login.java",
+          "src/main/java/com/appsecco/dvja/controllers/Register.java",
+          "src/main/java/com/appsecco/dvja/controllers/ResetPassword.java",
+          "src/main/java/com/appsecco/dvja/interceptors/AuthenticationInterceptor.java",
+          "src/main/java/com/appsecco/dvja/models/Product.java",
+          "src/main/java/com/appsecco/dvja/models/User.java",
+          "src/main/java/com/appsecco/dvja/services/UserAuthenticationService.java",
+          "src/main/java/com/appsecco/dvja/services/UserRegistrationService.java",
+          "src/main/java/com/appsecco/dvja/Constant.java",
+          "src/main/java/com/appsecco/example/ExampleSupport.java",
+          "src/main/java/com/appsecco/example/HelloWorld.java",
+          "src/main/java/com/appsecco/example/Login.java"
+        ]
+      },
+
+      "confidence_distribution": {
+        "0.90_to_1.00": 12,
+        "0.80_to_0.89": 1,
+        "0.70_to_0.79": 0,
+        "below_0.70": 0
+      },
+
+      "outputs": {
+        "findings_json": "findings.json",
+        "sarif": "scan-results.sarif",
+        "markdown_summary": "scan-summary.md",
+        "metrics": "sast-metrics.json"
+      }
+    }
+  ]
+}
