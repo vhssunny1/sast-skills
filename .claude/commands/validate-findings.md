@@ -24,7 +24,9 @@ Two findings are duplicates if they share ALL of:
 - Same `file`
 - Line numbers within ±5 of each other
 
-When duplicates exist:
+**Exception — cross-language findings are never deduplicated against intra-language findings:** If one finding has a `language_boundary` field (set by `/cross-language-taint`, prefix `XL-`) and the other does not, they represent different attack vectors at the same code location and must both be kept regardless of line proximity. The XL finding captures the full cross-language path (e.g. repo submission → LLM generation → stored documentation → render); the intra-language finding captures a direct path (e.g. catch handler without HTML escaping). These are distinct exploits even when they point to adjacent lines in the same file.
+
+When duplicates exist (after applying the exception above):
 - Keep the one with higher `confidence_after_trace` (if set), else higher `confidence`
 - Discard the rest
 - Record discarded finding IDs in `validation_notes`
@@ -54,6 +56,19 @@ Subtract points for conditions that increase confidence:
 | `confidence_after_trace` ≥ 0.90 | -0.20 |
 | `taint_path` has ≥ 2 steps (cross-file verified) | -0.10 |
 | Severity is Critical and CWE maps to well-known injection class | -0.10 |
+
+### Deployment context adjustment (config findings only)
+
+For findings that carry a `deployment_context` field (set by `config-audit`), apply these additional adjustments **after** the standard scoring above:
+
+| `deployment_context` | FP score delta | Rationale |
+|---|---|---|
+| `example_file` | +0.40 | Explicitly a sample — deployers know to replace values |
+| `development_template` | +0.30 | Committed dev config with documented warnings — risk only if warnings ignored |
+| `source_code_fallback` | -0.20 | Hardcoded in application logic — fires silently whether or not docs were read; override any template leniency |
+| `production_config` | 0 | No template signals — treat at full severity |
+
+**Important:** `source_code_fallback` always overrides other context signals. A value hardcoded in `constants.py` as a fallback is unconditional — even if the same value appears in a development template, the code path is separate and cannot be protected by deployment convention alone.
 
 Cap `fp_score` at 0.0 minimum and 1.0 maximum.
 
@@ -121,6 +136,37 @@ Add a top-level `validation_summary`:
     "confidence_after_trace 0.97 ≥ 0.90 → -0.20",
     "cross-file taint path with 2 steps → -0.10",
     "severity Critical, CWE-78 (injection) → -0.10"
+  ]
+}
+```
+
+Config finding example with deployment context adjustment:
+
+```json
+{
+  "fp_score": 0.30,
+  "validation_status": "needs_review",
+  "validation_notes": [
+    "taint_confirmed: null (config finding, no taint trace) → +0.20",
+    "confidence_after_trace not set → no adjustment",
+    "deployment_context: development_template → +0.30",
+    "adjacent warning comment: 'Make sure you set this to a unique secure random value on production'",
+    "net fp_score: 0.50 → capped and rounded to 0.50 → needs_review"
+  ]
+}
+```
+
+Source code fallback example (hardcoded constant — deployment context does NOT reduce severity):
+
+```json
+{
+  "fp_score": 0.00,
+  "validation_status": "confirmed",
+  "validation_notes": [
+    "taint_confirmed: null (config finding) → +0.20",
+    "deployment_context: source_code_fallback → -0.20 (overrides template leniency)",
+    "severity Critical, CWE-521 → -0.10",
+    "net fp_score: -0.10 → capped at 0.00 → confirmed"
   ]
 }
 ```

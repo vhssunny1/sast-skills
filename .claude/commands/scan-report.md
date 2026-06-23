@@ -242,6 +242,27 @@ Run with `--ground-truth dvja-ground-truth.MD` to compute precision and recall.
 
 ---
 
+## Security Positive Signals
+
+Scan `findings[]` for evidence that security controls ARE working. This section helps developers understand the security posture holistically — not just what's broken.
+
+Extract:
+1. **Verified sanitizers** — any finding where `taint_confirmed: false` and the taint_path note says "sanitization is effective", "taint chain BROKEN", or the method name contains `sanitize`, `clean`, `escape`, `encode`. Report the sanitizer name and what it protects against.
+2. **Existing but uncalled guards** — from `sanitization_gaps[]` in any finding, extract instances of "Safety function `X` exists in `Y` but is not called here". The existence of these functions shows security awareness; the gap shows where to apply them.
+3. **Framework-level protections** — look in `taint_path` notes for mentions of: CSRF protection enabled, `@protect()` or `@login_required` decorators, HTTPS-only cookies, rate limiting, allowlists in middleware.
+
+Render as a compact table:
+
+| Control | Where | Protects Against | Status |
+|---|---|---|---|
+| `nh3.clean()` | `superset/utils/core.py:554` | XSS via markdown content | Verified effective |
+| `is_safe_host()` | `superset/utils/network.py` | SSRF | Exists but not called on test_connection path |
+| CSRF protection | Flask-WTF default | CSRF | Enabled by default |
+
+If no positive signals are found, omit this section rather than writing "none found."
+
+---
+
 ## Recommendations
 
 List the top 3 fix priorities based on severity + confirmation status.

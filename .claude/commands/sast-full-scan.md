@@ -33,19 +33,24 @@ VALIDATE         → "How confident are we in each finding? What is probably noi
 
 SCAN-REPORT      → "How do we communicate this to humans and tools?"
                    SARIF for tooling. Markdown for humans. Root-cause grouping.
+
+GENERATE-DAST-TESTS (--dast only) → "How do I dynamically confirm these findings?"
+                   Produces a runnable dast-tests.py. Off by default.
+                   Run it when you have a live app and want behavioral confirmation.
 ```
 
 ---
 
 ## Input
 
-`$ARGUMENTS` format: `<repo-path> [--ground-truth <path>] [--out-dir <path>] [--skip-taint] [--skip-config-audit]`
+`$ARGUMENTS` format: `<repo-path> [--ground-truth <path>] [--out-dir <path>] [--skip-taint] [--skip-config-audit] [--dast]`
 
 - `<repo-path>` — required. Path to the repository root (any language).
 - `--ground-truth <path>` — optional. Path to ground truth file for precision/recall.
 - `--out-dir <path>` — where to write all outputs (default: `./sast-runs/<timestamp>/`)
 - `--skip-taint` — skip taint-trace (faster, higher FP rate)
 - `--skip-config-audit` — skip config-audit step (use when no .env or docker-compose files present)
+- `--dast` — optional. After scan-report, generate a DAST test script (`dast-tests.py`) from confirmed findings. Off by default — run only when you intend to dynamically verify findings against a live app.
 
 If no repo path provided, print usage and stop.
 
@@ -256,6 +261,31 @@ Print:
 
 ---
 
+## Step 7b — GENERATE-DAST-TESTS (optional — only when --dast is passed)
+
+**Purpose:** Turn confirmed findings into a runnable behavioral test script for dynamic verification against a live application.
+
+If `--dast` was NOT passed:
+```
+[5b] generate-dast-tests skipped — pass --dast to generate a DAST test script
+```
+
+If `--dast` was passed: run `/generate-dast-tests --findings findings.json --base-url <base_url>`
+
+Where `<base_url>` defaults to `http://localhost:8088` if not inferable from the repo (check docker-compose port mappings in the run's config-audit output).
+
+Writes `dast-tests.py`. Copy to `<out-dir>/dast-tests.py`.
+
+Print:
+```
+[5b] generate-dast-tests complete — dast-tests.py written
+     Run AFTER starting the application:
+       docker compose up -d   (wait ~2 min)
+       python dast-tests.py
+```
+
+---
+
 ## Step 8 — Finalize
 
 Update `run-manifest.json`:
@@ -311,6 +341,7 @@ SAST full scan complete.
     scan-results.sarif      — SARIF 2.1.0 for IDE/GitHub
     scan-summary.md         — human-readable report with fixes
     run-manifest.json       — run metadata
+    dast-tests.py           — DAST confirmation script (only if --dast was passed)
 ```
 
 ---
@@ -348,4 +379,7 @@ If any step fails:
 
 # Custom output directory
 /sast-full-scan my-repo --out-dir ./reports/sprint-42/
+
+# Full pipeline + DAST script generation (run dast-tests.py separately once app is up)
+/sast-full-scan my-repo --dast
 ```

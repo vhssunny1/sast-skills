@@ -23,9 +23,11 @@ Walk `<repo-path>`. Collect these files:
 - `.env`, `.env.local`, `.env.production`, `.env.development`, `*.env`
 - `docker-compose.yml`, `docker-compose.yaml`, `compose.yaml`, `compose.yml`
 - `settings.py`, `settings/*.py`, `config.py`, `config/*.py`
+- `constants.py`, `defaults.py`, `secrets.py` — Python files with hardcoded fallback values
 - `application.yml`, `application.properties` (Spring)
 - `config/environments/*.rb` (Rails)
 - `appsettings.json`, `appsettings.Production.json` (.NET)
+- `config.json`, `config.example.json`, `config*.json`, `*.config.json` — JSON config files (websocket servers, queue workers, sidecars)
 
 If none found, note it in warnings and stop.
 
@@ -43,6 +45,8 @@ Look for env vars that gate security-sensitive features. Flag any that are enabl
 |---|---|
 | `*_LOGIN_ENABLED=true`, `*_AUTH_BYPASS*=true`, `REMOTE_USER*=true` | Authentication bypass features enabled — verify network isolation |
 | `DEBUG=true`, `FLASK_DEBUG=1`, `DJANGO_DEBUG=True`, `RAILS_ENV=development` | Debug mode exposes stack traces, may disable auth checks |
+| `DEV_MODE=true`, `DEV_MODE=1` | App-specific dev mode — often disables auth enforcement or enables unsafe routes |
+| `*_ENV=development`, `*_ENVIRONMENT=development`, `SUPERSET_ENV=development`, `NODE_ENV=development` in server-side services | Framework environment flag — enables dev behaviors even when `DEBUG` is separately false |
 | `TESTING=true`, `TEST_MODE=1` | Test modes often disable security middleware |
 | `*_ENABLED=true` where the var name contains `ADMIN`, `SUPERUSER`, `INTERNAL`, `UNSAFE` | Administrative/unsafe features enabled |
 
@@ -54,10 +58,16 @@ Check these patterns:
 
 | Pattern | Risk |
 |---|---|
-| Value contains `secret`, `changeme`, `password`, `example`, `test`, `sample`, `default`, `local`, `dev` | Placeholder value likely to be reused in production |
+| Value contains `secret`, `changeme`, `change_me`, `change-me`, `password`, `example`, `test`, `sample`, `default`, `local`, `dev` | Placeholder value likely to be reused in production |
 | Value is fewer than 32 characters | Too short for a cryptographic secret |
-| `SECRET_KEY`, `COOKIE_SECRET`, `JWT_SECRET`, `SESSION_SECRET`, `API_KEY` set to short or obvious values | Session forgery, JWT bypass |
+| Any variable whose name contains `SECRET`, `JWT`, `TOKEN_SECRET`, `API_KEY`, `COOKIE_SECRET`, `SESSION_SECRET` set to short or obviously placeholder values | Session forgery, JWT bypass — flag ALL matching vars, not just the primary SECRET_KEY. Applications often have secondary secrets (guest tokens, async-query tokens, websocket tokens) that are equally exploitable. |
 | Same value used for multiple secrets (e.g. `SECRET_KEY` == `COOKIE_SECRET`) | Key reuse reduces isolation |
+
+**Multi-secret scanning:** Many frameworks use multiple JWT secrets for different token types. Flag each one independently:
+- Flask session: `SECRET_KEY`, `SUPERSET_SECRET_KEY`
+- Guest/embed tokens: `GUEST_TOKEN_JWT_SECRET`, `*_GUEST_SECRET*`
+- Async/queue tokens: `GLOBAL_ASYNC_QUERIES_JWT_SECRET`, `*_ASYNC_*SECRET*`
+- Websocket/sidecar: look in JSON config files for `"jwtSecret"` fields
 
 ### 2c — Dangerous boolean defaults
 
@@ -98,6 +108,28 @@ If `environment:` block hard-codes values like `SECRET_KEY: mysecret` instead of
 
 ---
 
+## Step 3b — Analyze constants.py / defaults.py / secrets.py
+
+For Python files named `constants.py`, `defaults.py`, `secrets.py` at any depth:
+
+Read the file. Look for string literals assigned to names that suggest secrets:
+- Variable names containing `SECRET`, `KEY`, `JWT`, `PASSWORD`, `TOKEN`, `CREDENTIAL`
+- Values matching: `CHANGE_ME*`, `*CHANGE_ME*`, `test-*`, `*-test`, `example`, `REPLACE_*`, `TODO_*`, any value surrounded by angle brackets like `<your-secret-here>`
+
+These are **hardcoded fallback values** — the intent is for deployers to override them in `.env`, but if they don't, the application silently uses the insecure default. Flag each as a critical finding with severity based on the secret's purpose:
+- Session/cookie key → critical (session forgery)
+- JWT signing key → critical (auth bypass)
+- Database password → high
+- API key → medium
+
+Example pattern to flag:
+```python
+CHANGE_ME_SECRET_KEY = "CHANGE_ME_TO_A_COMPLEX_RANDOM_SECRET"  # noqa: S105
+CHANGE_ME_GUEST_TOKEN_JWT_SECRET = "test-guest-secret-change-me"  # noqa: S105
+```
+
+---
+
 ## Step 4 — Analyze settings.py / application.properties
 
 For Python `settings.py` or `config.py`:
@@ -110,6 +142,50 @@ For Spring `application.yml`:
 - `management.endpoints.web.exposure.include: "*"` → Actuator exposes all endpoints including `/env`, `/heapdump`
 - `spring.security.enabled: false`
 - `server.ssl.enabled: false`
+
+---
+
+## Step 4b — Classify deployment context for each finding
+
+Before scoring any config finding, determine the deployment intent of the file it came from. This prevents development templates from being reported at the same severity as production secrets.
+
+### Signals to check (in order)
+
+**1. Filename signals → `example_file`**
+
+If the config filename (not path) contains any of: `example`, `sample`, `template`, `default`, `stub`, `proto`
+→ classify as `example_file`
+
+Examples: `config.example.json`, `.env.example`, `docker-compose.template.yml`
+
+**2. Committed with warning comments → `development_template`**
+
+Read the lines immediately before and after each flagged value. If any adjacent line (within 3 lines) contains phrases like:
+- "change in production", "set this to a unique", "do not use in production"
+- "replace before deploy", "override in production", "unique secure random"
+- "Make sure you set", "TODO:", "FIXME:", "CHANGE_ME" (as a comment, not a value)
+
+→ classify as `development_template`
+
+**3. File is tracked in git but has warning comments elsewhere in the same file → `development_template`**
+
+If the overall file contains a header or block comment warning that values must be replaced for production (e.g. a disclaimer at the top of a docker-compose file), classify all findings from that file as `development_template`.
+
+**4. Hardcoded in application source code as a fallback → override to `source_code_fallback`**
+
+If the finding's `file` is a Python/JS/TS source file (not a config file) — e.g. `constants.py`, `defaults.py` — and the value is a string literal assigned as a module-level constant, classify as `source_code_fallback`. This overrides any template signals: code-level fallbacks are unconditional and cannot be "overridden" at deploy time through documented convention.
+
+**5. No template signals present → `production_config`**
+
+If none of the above apply, classify as `production_config`.
+
+### Store on the finding
+
+Add `deployment_context` field to each config finding:
+- `"example_file"` — explicitly a sample/template file
+- `"development_template"` — committed dev config with documented warnings
+- `"source_code_fallback"` — hardcoded in application source, unconditional
+- `"production_config"` — no template signals, treat as real
 
 ---
 
@@ -134,7 +210,8 @@ Append to `findings.json` (create if not exists). Use the same schema as find-vu
   "evidence": "REDASH_REMOTE_USER_LOGIN_ENABLED=true",
   "description": "Remote user authentication is enabled. When the backend port is directly reachable (common in Docker deployments), any attacker can authenticate as any user by forging the X-Forwarded-Remote-User header.",
   "fix_hint": "Set REDASH_REMOTE_USER_LOGIN_ENABLED=false unless SSO proxy is deployed, or add HMAC signature verification to the remote_user_auth.py login endpoint.",
-  "condition": "REDASH_REMOTE_USER_LOGIN_ENABLED=true"
+  "condition": "REDASH_REMOTE_USER_LOGIN_ENABLED=true",
+  "deployment_context": "production_config"
 }
 ```
 

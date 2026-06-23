@@ -29,6 +29,35 @@ Rendered via marker.bindPopup(item.name)   ← Leaflet renders as raw HTML
 
 Neither the Python scanner nor the TypeScript scanner sees the full path alone.
 
+### LLM taint propagation (prompt injection → stored XSS)
+
+A second class of cross-language finding involves an LLM as the taint propagation mechanism:
+
+```
+User submits repo or document (attacker-controlled content)
+    ↓  [Python backend — LLM pipeline]
+Content included in LLM prompt as context (prompt injection vector)
+    ↓  [LLM output — cannot be statically verified]
+LLM generates output containing malicious payload (e.g. mermaid diagram with HTML node labels)
+    ↓  [Python backend — file write / DB store]
+Generated content stored to filesystem or DB without sanitization
+    ↓  [TypeScript frontend — component render]
+Content fetched and rendered via innerHTML / mermaid(securityLevel:'loose') / dangerouslySetInnerHTML
+```
+
+This is a **prompt injection → stored XSS** path. Key differences from direct stored-XSS:
+- The attacker cannot guarantee the LLM will emit the payload (it may refuse or rephrase it) — hence confidence is capped at 0.70
+- The attack surface is the LLM's context window — any user-supplied text that becomes prompt context is a source
+- The taint path must include a `role: "llm_transformation"` step to mark the boundary
+
+**When to create an LLM taint finding:**
+1. You confirmed a backend LLM pipeline that processes user-controlled content (repo files, messages, documents)
+2. The LLM output is stored to a file or DB without HTML/script sanitization
+3. A frontend component fetches and renders that stored content via `innerHTML`, `mermaid` with `securityLevel:'loose'`, or `dangerouslySetInnerHTML`
+4. No sanitization exists on either the store side (Python) or the render side (TypeScript)
+
+**Confidence for LLM taint findings:** 0.60–0.70 (the static code path is confirmed; whether the LLM actually emits a payload is probabilistic).
+
 ---
 
 ## Step 1 — Load inputs
@@ -75,6 +104,8 @@ Focus on these render patterns:
 | `dangerouslySetInnerHTML={{ __html: item.body }}` | React XSS |
 | `v-html="item.content"` | Vue XSS |
 | Template literal in `innerHTML`: `` element.innerHTML = `<div>${item.name}</div>` `` | DOM XSS |
+| `mermaid.initialize({ securityLevel: 'loose' })` + `element.innerHTML = svg` where svg comes from LLM-generated stored content | XSS via diagram injection — LLM-generated mermaid diagrams with HTML node labels execute when rendered with `securityLevel:'loose'` |
+| `element.innerHTML = \`<pre>${code}</pre>\`` without HTML-escaping `code` in catch/error handlers | XSS via error fallback — mermaid catch handlers that inject raw code into DOM without `<` → `&lt;` escaping |
 
 For each render point, record:
 - Which API endpoint's response field is being rendered
@@ -141,6 +172,8 @@ Append to `findings.json`. Use prefix `XL-` for cross-language finding IDs:
 - `language_boundary` is required for all XL findings — both sides must be cited
 - Do not flag API fields where the backend applies allowlist validation that rejects HTML content (e.g. `regex: r'^[a-zA-Z0-9 ]+$'`)
 - Do not flag React JSX text interpolation (`{item.name}`) — React encodes text content by default. Only `dangerouslySetInnerHTML`, `innerHTML`, and mapping library popup methods are dangerous.
+- **LLM taint findings must use `role: "llm_transformation"` in `taint_path`** for the LLM step, and must set confidence ≤ 0.70. Do not invent LLM payload generation — only confirm the code paths on both sides (user content enters LLM context; LLM output is stored unsanitized; frontend renders unsanitized).
+- **XL findings with `language_boundary` are protected from dedup** in `/validate-findings` — they will not be merged with adjacent intra-language findings at the same file/line even if CWE and line match. Do not manually suppress them.
 
 ---
 
