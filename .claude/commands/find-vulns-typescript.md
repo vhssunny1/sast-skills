@@ -77,12 +77,14 @@ Taint propagates through: variable assignment, template literals, object spread,
 | Code injection | `eval(tainted)`, `new Function(tainted)`, `setTimeout(tainted, n)` with string (not arrow function), `setInterval(tainted, n)` | Arbitrary code execution |
 | Open redirect | `window.location.href = tainted`, `window.location = tainted`, `router.push(tainted)` where tainted can be an external URL, `res.redirect(tainted)` (Express) | Phishing, session theft |
 | postMessage to any origin | `window.postMessage(data, "*")` — broad target allows cross-origin data theft | Data exfiltration |
+| Session cookie exfiltration | `fetch(userControlledUrl, { credentials: 'include' })` — when `url` is attacker-controlled (e.g. from `useSearchParams().get('url')`), the browser sends session cookies to the attacker's server before CORS can block the response. The response body is blocked but the cookies are already delivered. This is distinct from SSRF: the impact is session hijacking, not network probing. Assign HIGH severity. Fix: validate `new URL(url, window.location.origin).origin === window.location.origin` before fetching, or proxy server-side. | Session hijacking via cookie exfiltration |
 | SSRF (Node) | `fetch(tainted)`, `axios.get(tainted)`, `node-fetch(tainted)`, `got(tainted)` where URL is user-controlled | Internal network probe |
 | Command injection (Node) | `child_process.exec(tainted)`, `child_process.exec(\`cmd ${tainted}\`)`, `child_process.spawn("sh", ["-c", tainted])` | Remote code execution |
 | Path traversal (Node) | `fs.readFile(path.join(base, tainted))` without `path.resolve()` + base-containment check, `fs.readFileSync(tainted)`, `res.sendFile(tainted)` | Arbitrary file read |
 | SQL injection (Node) | Template literal SQL: `` `SELECT * FROM users WHERE id = ${tainted}` ``, string concatenation in DB query | Data exfiltration |
 | Prototype pollution | `Object.assign(target, userControlledObj)` or deep merge where keys are not validated — can corrupt `Object.prototype` | Application logic bypass |
 | Mapping library HTML injection | `marker.bindPopup(tainted)`, `layer.setPopupContent(tainted)`, `L.popup().setContent(tainted)` (Leaflet); `new mapboxgl.Popup().setHTML(tainted)` (Mapbox) — mapping libraries render popup content as raw HTML by default | XSS via map popup — user-supplied location names, coordinates, or metadata stored in DB and rendered in browser without sanitization |
+| CSS-as-HTML injection | `styleElement.innerHTML = userCss` where `styleElement` is a `<style>` DOM node — assigning user-controlled CSS to a style element's innerHTML allows `</style>` tag injection, which closes the style block and renders arbitrary HTML. A payload like `</style><img src=x onerror=alert(1)>` executes JavaScript. | Stored XSS — dashboard CSS, theme CSS, user-defined styles stored in DB and injected at render time |
 
 ### Sanitization that breaks the chain
 
@@ -96,6 +98,17 @@ Taint propagates through: variable assignment, template literals, object spread,
 - `path.resolve(path.join(base, tainted))` + checking result starts with `base` — breaks path traversal
 - Content Security Policy (reduces XSS impact but does not prevent the vulnerability)
 - **Not sanitization:** `encodeURI()` (does not encode `'`, `"`, `<`, `>`), null/undefined checks, `typeof` checks, `Array.isArray()`
+- **Not sanitization — catch-true anti-pattern:** A URL/scheme validation function where the `catch` block returns `true` or a permissive value is a bypass, not protection:
+  ```js
+  // VULNERABLE — exception path returns "allowed"
+  function isAllowedScheme(url: string): boolean {
+    try { new URL(url); return true; }
+    catch { return true; }  // parsing failure → allow
+  }
+  ```
+  `new URL("//evil.com")` throws in some environments; the catch block's `return true` makes protocol-relative URLs bypass the check entirely. When reviewing URL/scheme validation functions, always check what the `catch` branch returns.
+- **Not sanitization — self-documented incomplete sanitizers:** If a CSS or HTML sanitization function has a comment like "not a complete XSS sanitizer" or "does not protect against all injection", treat it as absent sanitization for the purposes of finding confidence scoring. Read the function's own documentation.
+- **Not sanitization — custom sanitizers that escape the wrong characters:** When a custom function is called before an HTML sink (e.g. `sanitizeMermaid(code)` before `innerHTML`), read its body and verify it escapes the characters relevant to the sink type. A function that only escapes `{` and `}` (e.g. brace escaping for template syntax) provides zero XSS protection because `<`, `>`, `"`, and `'` remain unescaped. Only treat a custom function as sanitization if it demonstrably converts `<` → `&lt;` and `>` → `&gt;` (for HTML sinks) or applies `DOMPurify.sanitize()`. If in doubt, read the function — do not assume from its name.
 
 ---
 
@@ -112,6 +125,12 @@ For every file in the scan queue, read the full file, then ask:
 **Q4 — Sensitive data exposure:** Are API keys, JWTs, or secrets hard-coded in client-side code or included in client-side bundles (e.g. `process.env.SECRET_KEY` in a React component)?
 
 **Q5 — Prototype pollution:** Are object spread or merge operations performed on user-controlled keys without key validation?
+
+**Q6 — Security validation catch blocks:** When you find a function whose name or purpose is to validate URLs, schemes, or hostnames (e.g. `isAllowedScheme`, `isSafeUrl`, `isValidHost`, `checkRedirect`), read the full function including its `catch` / `except` block. If the catch block:
+- returns `true`, `"allow"`, or calls `next()` without restriction — the exception path bypasses the validation (catch-true anti-pattern)
+- returns `false` or throws — the function is safe on the exception path
+
+Flag catch-true as CWE-601 (open redirect) or CWE-918 (SSRF) at medium severity with confidence 0.80.
 
 ---
 
@@ -137,6 +156,7 @@ For every file in the scan queue, read the full file, then ask:
 | Code injection (eval) | CWE-94 | A03:2021 |
 | Command injection (Node) | CWE-78 | A03:2021 |
 | SQL injection (Node) | CWE-89 | A03:2021 |
+| Session cookie exfiltration via fetch | CWE-918 | A10:2021 |
 | SSRF (Node fetch) | CWE-918 | A10:2021 |
 | Path traversal (Node fs) | CWE-22 | A01:2021 |
 | Open redirect | CWE-601 | A01:2021 |

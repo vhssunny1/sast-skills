@@ -91,6 +91,8 @@ Check these files in order (first found wins):
 - `.env` / `*.env` at repo root and `docker/` — flag `DEBUG=true`, `TESTING=true`, feature flags enabled (e.g. `REMOTE_USER_LOGIN_ENABLED=true`), or secrets that look like defaults (`secret`, `changeme`, `sast-test`)
 - `docker-compose.yml` / `compose.yaml` — flag ports bound to `0.0.0.0`, `skip_frontend_build` or `FLASK_ENV=development`, and backend ports exposed alongside a proxy
 - `settings*.py` / `config*.py` — flag `DEBUG = True`, `ALLOWED_HOSTS = ["*"]`, `SECRET_KEY` set to a short/guessable string
+- `constants*.py` / `const/*.py` / `*_config.json` — flag `DEFAULT_ROUTE_ACCESS = True`, `ALLOW_ALL_ROUTES = True`, `DEFAULT_ACCESS = True`, or any boolean constant that grants access by default. These create implicit authorization bypass for any route not explicitly listed in an access control config. Add to `config_warnings[]`: "DEFAULT_ROUTE_ACCESS = True in <file> — routes not listed in route_group_access config are accessible to all authenticated users; authorization is opt-in, not opt-out."
+- Route group access config files (`route_group_access.json`, `route_permissions.json`, `acl.json`) — count how many routes have explicit restrictions vs how many fall through to the default. If the default is permissive, note it.
 
 Add a `config_warnings[]` array to the output for any dangerous defaults found.
 
@@ -158,7 +160,7 @@ While reading the first 120 lines for role classification, also assign `security
 | Score | Indicators |
 |---|---|
 | 5 | `exec(`, `eval(`, `subprocess`, `RestrictedPython`, sandbox setup (`restricted_globals`), `_getattr_`, `_setattr_` |
-| 4 | `request.headers.get(`, `REMOTE_USER`, feature-flag reads (`os.getenv("..._ENABLED")`), `pickle`, `yaml.load` |
+| 4 | `request.headers.get(`, `REMOTE_USER`, feature-flag reads (`os.getenv("..._ENABLED")`), `pickle`, `yaml.load`, `DEFAULT_ROUTE_ACCESS`, `DEFAULT_ACCESS`, `ALLOW_ALL_ROUTES` (permissive default access control constants) |
 | 3 | `requests.get(`, `httpx`, DB query construction, `open(`, `os.path.join` |
 | 2 | DB model definitions, serializers, standard business logic |
 | 1 | Pure data classes, constants, type stubs |

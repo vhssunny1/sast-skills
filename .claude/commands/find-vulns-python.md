@@ -54,6 +54,12 @@ Within each tier, read files in descending `security_priority` order (from crawl
 - `request.headers.get("key")` — raw headers
 - `kwargs["pk"]` / URL kwargs from `urls.py`
 
+**Flask-AppBuilder (FAB):**
+- Routes defined via `@expose("/path")` on classes inheriting from `BaseView`, `BaseSupersetView`, `ModelRestApi`, or `RestApi`
+- User input from `request.json`, `request.args`, `request.form`, `request.get_json()` — same as Flask
+- Auth guard via `@protect()` decorator — if absent on an expose'd method, the endpoint is unauthenticated
+- FAB's `self.datamodel.add()`, `self.datamodel.edit()`, `self.datamodel.delete()` methods are ORM sinks
+
 **Common across frameworks:**
 - Any URL path parameter bound to a function argument
 - JSON body fields (when body is parsed and fields used without validation)
@@ -69,6 +75,7 @@ Taint propagates through: function arguments, return values, variable assignment
 | Code injection | `eval(tainted)`, `exec(tainted)` | Remote code execution |
 | Path traversal | `open(tainted)`, `open(os.path.join(base, tainted))` without resolve guard, `shutil.copy(tainted, ...)`, `shutil.move(tainted, ...)`, `os.makedirs(tainted)`, `pathlib.Path(tainted).read_text()` | Read/write arbitrary files |
 | SSRF | `requests.get(tainted)`, `requests.post(tainted)`, `httpx.get(tainted)`, `aiohttp.ClientSession().get(tainted)`, `urllib.request.urlopen(tainted)`, `Repo.clone_from(tainted, ...)` | Internal network probe, metadata theft |
+| SSRF via host/port helpers | `is_port_open(tainted_host, port)`, `do_ping(tainted_host)`, `socket.connect((tainted_host, port))`, `socket.getaddrinfo(tainted_host, ...)` — SSRF through network utility functions that take host/port separately rather than a full URL | Internal network probe — same risk as URL-based SSRF, harder to spot because the sink is not a `requests.get()` call |
 | Credential injection into URL | `f"https://{user}:{token}@{tainted}"` — credentials embedded in attacker-controlled host | Credential exfiltration |
 | SQL injection | `db.execute(f"...{tainted}...")`, `cursor.execute("..." + tainted)`, `session.execute(text(f"...{tainted}..."))`, raw string SQL passed to ORM | Data exfiltration, auth bypass |
 | Template injection | `render_template_string(tainted)`, `jinja2.Template(tainted).render()`, `env.from_string(tainted)` | Remote code execution via SSTI |
@@ -76,6 +83,8 @@ Taint propagates through: function arguments, return values, variable assignment
 | Insecure deserialization | `pickle.loads(tainted)`, `pickle.load(file_from_user)`, `yaml.load(tainted)` without `Loader=yaml.SafeLoader`, `marshal.loads(tainted)` | Remote code execution |
 | Open redirect | `redirect(tainted)`, `RedirectResponse(url=tainted)`, `flask.redirect(tainted)` without URL validation | Phishing, session token theft |
 | Auth decision from header | `request.headers.get("x-forwarded-email")` used as identity (not JWT-validated state), `request.headers.get(group_key)` used for group membership/authorization | IDOR, privilege escalation |
+| oauth2-proxy group bypass | JWT middleware validates `Header-A` and stores `request.state.user_data`, but separately reads `request.headers.get(groups_key)` for group/role authorization — the two reads are decoupled, so an attacker who passes JWT validation can add `groups: admin` as a plain header and gain privileged access. Pattern: `validated = parse_jwt(request.headers["X-Forwarded-Access-Token"])` ... `request.state.user_groups = headers.get(groups_key)`. Fix: read groups from the validated JWT payload (`data.get(groups_key)`), not from raw headers. | Admin privilege escalation |
+| Or-chain identity fallback | `resolved = (request.headers.get("x-forwarded-email") or body.user_email or "")` — falls back to user-controlled form/body field when the authenticated header is absent. The JWT-validated identity at `request.state.user_data["email"]` is ignored. Any authenticated user who omits or strips the proxy header can impersonate arbitrary accounts. | Identity spoofing, IDOR |
 | Sensitive data in logs | `logger.info(f"password={password}")`, `logger.debug(token)`, logging JWT or API keys | Credential exposure in log files |
 | Sandbox escape | `exec(user_code, restricted_globals, locals)` where `restricted_globals["_getattr_"] = getattr` (real getattr, not `safe_getattr`); also: `restricted_globals["getattr"] = getattr` exposed as a named builtin. When `_getattr_` is real `getattr`, RestrictedPython provides zero isolation — class hierarchy traversal finds `subprocess.Popen` without any `import`. | Full OS command execution from sandboxed user code |
 | Async queue taint | `queue.enqueue(func, tainted_arg)` or `task.delay(tainted_arg)` — tainted data is serialized to Redis/broker and executed in a worker process. The worker becomes the effective sink even though it runs in a different process. | Deferred execution of injected data across process boundary |
@@ -114,6 +123,17 @@ For every file in the scan queue, read the full file, then for each function/met
 4. Pay special attention to named builtins exposed alongside guards: `builtins["getattr"] = getattr` allows the same bypass via function-call form even if the guard is otherwise set correctly.
 
 **Q7 — Env-gated feature flags:** Does this function activate a dangerous code path only when an environment variable is set (e.g. `if settings.REMOTE_USER_LOGIN_ENABLED:`)? If yes, report a conditional finding with a `condition` field. These are real vulnerabilities — the condition just scopes when they are exploitable.
+
+**Q9 — JWT middleware authorization split:** When you find a middleware or auth layer that (a) validates a JWT and stores the payload in `request.state` or `g`, AND (b) also reads a separate header for group/role authorization — verify that BOTH reads come from the same validated source. The group/role read is dangerous if it uses `request.headers.get(...)` instead of the already-validated state object. Even if JWT validation is solid, reading groups from a separate raw header completely bypasses it.
+
+Also look for or-chain identity resolution: `resolved_email = (header_value or body.email or "")`. Any or-chain that falls back to a user-supplied body field is a bypass when the first term is absent. The fix is to use only the JWT-validated state: `request.state.user_data.get("email")`.
+
+**Q8 — Defense exists but not called:** When you identify an SSRF, path traversal, open redirect, or SQL sink with no sanitization visible in the current file, scan the `files[]` list from `crawl-output.json` for utility files (`utils/`, `helpers/`, `lib/`) that contain functions named `is_safe_host`, `validate_url`, `check_host`, `allowed_redirect`, `safe_path`, `validate_scheme`, or similar. If such a function exists elsewhere in the codebase but is NOT called at the vulnerable sink:
+- Confirm the finding as real (the developer knew the risk and wrote a guard, but forgot to wire it)
+- Add to `sanitization_gaps`: "Safety function `<name>` exists in `<file>` but is not called at this sink — calling it would fix this."
+- Set confidence 0.95 (existence of a named guard function is strong evidence the sink was known to be dangerous)
+
+This pattern — "defense written but not deployed" — is one of the most exploitable SSRF/redirect classes because the fix is a single function call.
 
 ---
 
