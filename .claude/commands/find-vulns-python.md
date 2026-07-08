@@ -22,9 +22,9 @@ Analyze files in this priority order:
 
 1. `entry_point` files (routers, views, API handlers)
 2. `middleware` files
-3. `dao` files
+3. `dao` files, `async_worker` files (Celery, RQ, Dramatiq, Huey tasks), `pipeline_worker` files — elevated to tier 3 because workers process user-uploaded content and are high-risk for path traversal, SSRF, and injection
 4. `service` files
-5. `async_worker` files (Celery, RQ, Dramatiq, Huey tasks)
+5. `downloader` files, `file_manager` files — file I/O utilities that process external or user-supplied paths
 6. `config`, `util` files
 
 Within each tier, read files in descending `security_priority` order (from crawl-output.json). Priority 5 files (sandbox setup, exec/eval, subprocess) are read before priority 3 files (HTTP calls, file I/O).
@@ -88,6 +88,19 @@ Taint propagates through: function arguments, return values, variable assignment
 | Sensitive data in logs | `logger.info(f"password={password}")`, `logger.debug(token)`, logging JWT or API keys | Credential exposure in log files |
 | Sandbox escape | `exec(user_code, restricted_globals, locals)` where `restricted_globals["_getattr_"] = getattr` (real getattr, not `safe_getattr`); also: `restricted_globals["getattr"] = getattr` exposed as a named builtin. When `_getattr_` is real `getattr`, RestrictedPython provides zero isolation — class hierarchy traversal finds `subprocess.Popen` without any `import`. | Full OS command execution from sandboxed user code |
 | Async queue taint | `queue.enqueue(func, tainted_arg)` or `task.delay(tainted_arg)` — tainted data is serialized to Redis/broker and executed in a worker process. The worker becomes the effective sink even though it runs in a different process. | Deferred execution of injected data across process boundary |
+| Path traversal — extended | `os.readlink(tainted)` without checking the resolved path stays within a base dir; `zipfile.ZipFile.extractall(path)` without iterating members and checking each `member.filename` for `..` or absolute paths (Zip Slip); `glob.glob(tainted_pattern)` where pattern contains `..` or `*`; `os.makedirs(tainted_output_dir)` where output_dir is user-supplied | Read/write arbitrary files, cross-tenant access, Zip Slip |
+| Symlink following | `shutil.copy(src, dst)` or `open(path)` where `path` is resolved from a user-uploaded archive or repo that may contain symlinks pointing outside the extraction directory — `os.path.islink()` check absent | Arbitrary host file read from uploaded content |
+| CSV / spreadsheet formula injection | `csv.writer.writerow([tainted_field])` in an admin export or report endpoint where `tainted_field` starts with `=`, `+`, `-`, `@` — spreadsheet applications treat these as formulas | Remote code execution via Excel/LibreOffice formula evaluation when admin opens the export |
+| YAML injection | `yaml.dump({"key": tainted})` or `yaml.dump(tainted_dict)` where dict keys or values come from user input containing YAML special characters (`{`, `}`, `:`, `\n`) — can break out of intended structure | Malformed YAML written to config or skill files; potential YAML deserialization if re-loaded |
+| Cypher injection (Neo4j / graph DB) | `session.run(f"MATCH (n) WHERE n.name = '{tainted}'")`, `graph.query(f"... {tainted} ...")` — string interpolation into Cypher queries | Data exfiltration from graph database, auth bypass |
+| NoSQL / query language injection | `collection.find({tainted_key: tainted_value})` where key is user-controlled; LogQL: `f'{{app="myapp"}} \|= "{tainted}"'` in Loki queries; PromQL user-controlled label values | Observability data exfiltration, query bypass |
+| Resource exhaustion — unbounded read | `file.read(user_size)` or `file.read()` on a user-uploaded file with no size cap before reading into memory; `response.content` on an HTTP response to a user-controlled URL with no `stream=True` + size limit | Memory exhaustion DoS |
+| Resource exhaustion — unbounded loop | `for item in range(user_count):` or `while user_condition:` where upper bound is user-controlled and uncapped | CPU exhaustion DoS |
+| Resource exhaustion — ReDoS | `re.compile(user_pattern)` or `re.search(user_pattern, large_input)` where `user_pattern` is supplied directly from request input — catastrophic backtracking on crafted inputs | CPU exhaustion via regex denial of service |
+| Resource exhaustion — decompression bomb | `gzip.decompress(user_bytes)` or `zipfile.extractall()` trusting `ZipInfo.file_size` from the archive header (falsifiable) without enforcing a decompressed-size limit | Disk/memory exhaustion |
+| Outbound data leakage — response | `return JSONResponse({"error": str(exception)})` — raw exception message (may contain internal paths, stack frames, DB credentials) returned to caller; `response.headers.update(upstream_response.headers)` forwarding internal service headers verbatim to client; `yield f"data: {traceback.format_exc()}"` in SSE stream | Internal system information exposure to external clients |
+| Outbound data leakage — logs | `logger.info(f"endpoint={os.environ['OPENAI_ENDPOINT']}")`, `logger.debug(f"token={access_token}")` — cloud service credentials or auth tokens written to stdout/log files unconditionally | Credential exposure in log aggregation systems |
+| Application-code supply chain | `urllib.request.urlretrieve(url, local_path)` or `requests.get(url, stream=True)` + `open(local_path, "wb").write(...)` followed by `os.chmod(local_path, 0o755)` + `subprocess.run([local_path, ...])` — binary downloaded from an external URL (GitHub release, CDN) and executed without cryptographic hash verification. Also: `subprocess.run(["pip", "install", git_plus_url])` where git_plus_url contains a branch name instead of a commit SHA (e.g. `git+https://github.com/org/repo@main`). | Supply-chain code execution — a compromised CDN or mutable git ref delivers a backdoored binary that runs with the application's privileges |
 
 ### Sanitization that breaks the chain
 
@@ -108,7 +121,25 @@ For every file in the scan queue, read the full file, then for each function/met
 
 **Q1 — Taint:** What are the inputs (parameters, HTTP sources)? What sinks are in the body? Does any tainted value reach a sink without effective sanitization?
 
-**Q2 — Authorization:** Does this function perform a privileged operation (accessing another user's data, admin action)? Is the identity check based on JWT-validated state (`request.state.user_data`) or on a raw HTTP header (`request.headers.get(...)`)?
+**Q2 — Authorization and Ownership (IDOR):** Does this function perform a privileged operation (accessing another user's data, admin action)?
+
+*Part A — Identity source:* Is the identity check based on JWT-validated state (`request.state.user_data`) or on a raw HTTP header (`request.headers.get(...)`)? Raw header = auth bypass risk.
+
+*Part B — Ownership verification (IDOR):* Does this function accept a resource identifier (`project_id`, `session_id`, `doc_id`, `item_id`, or any `*_id` / `*_uuid` path or body parameter) and then perform a DB fetch, update, or delete on that identifier?
+
+If yes, check: is the resource's owner field compared against the authenticated caller's identity at any point before or after the DB operation?
+
+**Ownership IS verified if:**
+- `if resource.owner_email != request.state.user_data["email"]: raise HTTPException(403)`
+- ORM query filtered by owner: `.filter(Project.id == id, Project.owner == caller)`
+- Explicit ownership helper called: `check_ownership(resource_id, caller)` that raises on mismatch
+
+**Ownership is NOT verified if:**
+- Only an authentication check exists: `if not request.state.user_data: raise 401` — being logged in ≠ owning this resource
+- Only a role check exists: `if "admin" not in groups` — role ≠ ownership of a specific resource instance
+- Resource is fetched and returned with no check at all
+
+Flag as IDOR (CWE-639) when a resource ID parameter is accepted, a DB operation uses it, and no ownership comparison exists. Severity: critical for destructive operations (delete, bulk delete); high for write/read of private per-user data; medium for non-sensitive cross-tenant read.
 
 **Q3 — Crypto:** Does this function hash or compare passwords/tokens? Is the algorithm appropriate (bcrypt, argon2, PBKDF2 via passlib)? Is MD5 or SHA1 used for passwords?
 
@@ -134,6 +165,39 @@ Also look for or-chain identity resolution: `resolved_email = (header_value or b
 - Set confidence 0.95 (existence of a named guard function is strong evidence the sink was known to be dangerous)
 
 This pattern — "defense written but not deployed" — is one of the most exploitable SSRF/redirect classes because the fix is a single function call.
+
+**Q10 — Outbound data leakage into responses or logs:** Does this function return sensitive system information in HTTP responses or write it to logs unconditionally?
+
+Look for:
+- `str(exception)` or `traceback.format_exc()` in a returned response body or SSE stream — exposes internal paths, DB connection strings, stack frames
+- `response.headers.update(upstream.headers)` — forwards internal service headers (auth tokens, trace IDs, internal hostnames) verbatim to the client
+- `os.environ.get("SECRET")` or `settings.INTERNAL_ENDPOINT` included in a JSON response field
+- `logger.info(f"... {token} ...")` or `logger.debug(credentials)` — cloud API keys, OAuth tokens, or DB passwords written to log output unconditionally (not just in debug mode)
+- Internal file paths or server hostnames in response headers (e.g. `X-Log-Path: /var/log/app/prod.log`)
+
+Flag with CWE-209 (information exposure via error message) or CWE-532 (sensitive information in log files).
+
+**Q11 — Dead defensive code (security function never wired up):** Does this module define a security-relevant function that is never called on any production code path?
+
+Look for:
+- Functions named `sanitize_*`, `validate_*`, `guardrail_*`, `check_*`, `filter_*`, `is_safe_*`, `redact_*` defined in the file
+- Check whether each such function has callers anywhere in the codebase (search `files[]` from crawl-output.json for the function name)
+- If the function is defined but has zero production callers (only tests, or nowhere), flag it: the developer identified the risk and implemented the fix but never wired it up
+
+This is high-signal: flag at medium severity with confidence 0.90. The fix is always a single function call at the unprotected site.
+
+**Q12 — Resource exhaustion (user controls computation bounds):** Does user input control the size, count, or complexity of a computation with no enforced upper limit?
+
+Look for:
+- `file.read(user_size)` or `read_bytes(n=user_n)` with no cap
+- `for _ in range(user_count):` with no `min(user_count, MAX)` guard
+- `re.search(user_pattern, corpus)` — user supplies the regex, not just the input string (ReDoS)
+- `zipfile.ZipFile.extractall()` where total extracted size is not tracked against a limit
+- `gzip.decompress(data)` or `bz2.decompress(data)` without a decompressed-size cap (decompression bomb)
+- `image_extract(user_video, max_frames=None)` — unbounded media processing
+- **Falsy size guard bypass:** `if not size: size = DEFAULT_MAX` — Python's `not` is truthy/falsy, so `size=0` (a valid user-supplied value) bypasses the guard entirely. Always use `if size is None:` for guard checks. When reviewing size guards, check whether the guard uses `if not x:` or `if x is None:` — only the latter is safe.
+
+Flag as CWE-400 (uncontrolled resource consumption) at medium severity. Sanitization: `min(user_value, SAFE_MAX)` or explicit size cap before the operation.
 
 ---
 
@@ -166,10 +230,22 @@ This pattern — "defense written but not deployed" — is one of the most explo
 | Insecure deserialization | CWE-502 | A08:2021 |
 | Unvalidated redirect | CWE-601 | A01:2021 |
 | Insecure auth (header-based) | CWE-287 | A01:2021 |
+| IDOR / missing ownership check | CWE-639 | A01:2021 |
 | Improper authorization | CWE-285 | A01:2021 |
 | Missing auth for critical function | CWE-306 | A07:2021 |
 | Sensitive data in logs | CWE-532 | A09:2021 |
 | Weak password hash | CWE-916 | A02:2021 |
+| CSV / spreadsheet formula injection | CWE-1236 | A03:2021 |
+| NoSQL / graph / observability query injection | CWE-943 | A03:2021 |
+| YAML injection | CWE-94 | A03:2021 |
+| Resource exhaustion / DoS | CWE-400 | A05:2021 |
+| ReDoS | CWE-1333 | A05:2021 |
+| Decompression bomb | CWE-409 | A05:2021 |
+| Information exposure via error message | CWE-209 | A09:2021 |
+| Information exposure in logs | CWE-532 | A09:2021 |
+| Zip Slip (archive path traversal) | CWE-22 | A01:2021 |
+| Symlink following | CWE-59 | A01:2021 |
+| Application-code supply chain (download without integrity check) | CWE-494 | A08:2021 |
 
 ---
 

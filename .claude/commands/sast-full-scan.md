@@ -192,7 +192,7 @@ Print:
 
 ## Step 4b — CROSS-LANGUAGE-TAINT (polyglot only)
 
-**Purpose:** In polyglot repos (Python backend + TypeScript frontend), find stored-XSS paths where Python stores user-controlled data → TypeScript renders it without sanitization. Single-language scans miss these flows entirely.
+**Purpose:** In polyglot repos (Python backend + TypeScript frontend), find stored-XSS paths where Python stores user-controlled data → TypeScript renders it without sanitization. Single-language scans miss these flows entirely. Also detects multi-hop prompt injection paths through RAG retrieval pipelines.
 
 If `polyglot: false` in `language-manifest.json`, skip this step:
 ```
@@ -207,6 +207,7 @@ Print:
 ```
 [2b] cross-language-taint complete — <N> cross-boundary findings added
 ```
+
 
 ---
 

@@ -36,7 +36,7 @@ Target Repo
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  /config-audit                                                  │
-│  Dangerous defaults in .env, docker-compose, settings files     │
+│  Secrets, flags, supply chain in .env / .cfg / Dockerfiles / CI│
 │  → findings.json  (appended)                                    │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
@@ -52,8 +52,8 @@ Target Repo
               ▼                                 │
 ┌─────────────────────────┐                    │
 │  /cross-language-taint  │                    │
-│  Python backend writes  │                    │
-│  → TS frontend renders  │                    │
+│  Stored-XSS across lang │                    │
+│  + RAG prompt injection │                    │
 │  → findings.json        │                    │
 └────────────┬────────────┘                    │
              └─────────────┬───────────────────┘
@@ -105,6 +105,15 @@ cd sast-skills
 # Skip taint trace for a faster pass
 /sast-full-scan /path/to/target-repo --skip-taint
 
+# Custom output directory
+/sast-full-scan /path/to/target-repo --out-dir ./reports/sprint-42/
+
+# Skip config-audit (use when no .env or docker-compose present)
+/sast-full-scan /path/to/target-repo --skip-config-audit
+
+# Generate a DAST test script from confirmed findings (run after the app is live)
+/sast-full-scan /path/to/target-repo --dast
+
 # Run individual skills
 /detect-language /path/to/target-repo
 /crawl-python /path/to/target-repo
@@ -112,6 +121,7 @@ cd sast-skills
 /config-audit /path/to/target-repo
 /find-vulns-python --crawl crawl-output.json
 /find-vulns-typescript --crawl crawl-output.json
+/find-vulns-java --crawl crawl-output.json
 /taint-trace --findings findings.json --crawl crawl-output.json
 /validate-findings --findings findings.json
 /scan-report --findings findings.json
@@ -127,7 +137,7 @@ cd sast-skills
 | Skill | Purpose |
 |---|---|
 | `detect-language` | Counts source files by extension, detects framework, writes routing manifest that tells `sast-full-scan` which crawl and find-vulns skills to run |
-| `sast-full-scan` | Chains all pipeline steps in order. Writes intermediate snapshots to `sast-runs/<timestamp>/`. Options: `--ground-truth`, `--skip-taint`, `--skip-config-audit` |
+| `sast-full-scan` | Chains all pipeline steps in order. Writes intermediate snapshots to `sast-runs/<timestamp>/`. Options: `--ground-truth`, `--skip-taint`, `--skip-config-audit`, `--out-dir`, `--dast` |
 
 ### Crawl — Attack Surface Mapping
 
@@ -141,11 +151,11 @@ cd sast-skills
 
 | Skill | Language | Vulnerability classes |
 |---|---|---|
-| `find-vulns` / `find-vulns-java` | Java | SQL injection, command injection, XSS, IDOR, open redirect, weak crypto, insecure deserialization, sensitive data in logs |
-| `find-vulns-python` | Python | Command injection, code injection, sandbox escape, SSRF, path traversal, insecure deserialization, auth bypass, async queue taint, env-gated conditional findings |
-| `find-vulns-typescript` | TypeScript / JS | DOM XSS, React XSS, mapping library popup injection, open redirect, SSRF, prototype pollution, hardcoded secrets |
-| `config-audit` | Any | Dangerous feature flags, weak or default secrets, backend ports exposed past a reverse proxy, debug mode, disabled security middleware |
-| `cross-language-taint` | Python + TypeScript | Stored-XSS paths where backend writes user data to DB and frontend renders it as raw HTML |
+| `find-vulns` / `find-vulns-java` | Java | SQL/JPQL injection, command injection, XSS, IDOR (missing ownership check), open redirect, weak crypto, insecure deserialization, outbound leakage, resource exhaustion/ReDoS, dead defensive code |
+| `find-vulns-python` | Python | Command injection, code injection, sandbox escape, SSRF, path traversal (Zip Slip, symlink, glob, output_dir), IDOR, YAML/CSV/Cypher/LogQL injection, insecure deserialization, auth bypass, async queue taint, outbound leakage, dead defensive code, resource exhaustion/ReDoS, application-code supply chain (download+execute without hash), falsy size guard bypass, env-gated conditional findings |
+| `find-vulns-typescript` | TypeScript / JS | DOM XSS, React XSS, mapping library popup injection, CSS-as-HTML injection, open redirect, SSRF, session cookie exfiltration, IDOR (Node/Express ownership checks), prototype pollution, hardcoded secrets, outbound leakage, dead defensive code, resource exhaustion/ReDoS |
+| `config-audit` | Any | Dangerous feature flags, weak/default secrets in `.env`/`.cfg`/`.ini`/`.conf`/`constants.py`, OIDC nonce disabled, CORS wildcard+credentials, mock auth bypass, Dockerfile supply chain (curl\|bash, unpinned git clone, binary wheels, FROM without digest), CI pipeline injection, backend ports exposed past reverse proxy |
+| `cross-language-taint` | Python + TypeScript | Stored-XSS paths where Python backend writes user data and TypeScript frontend renders as raw HTML; multi-hop prompt injection via RAG retrieval pipeline |
 
 ### Taint Tracing & Validation
 
@@ -187,6 +197,10 @@ Run these directly on a repo without going through the full pipeline.
 **Feature-flag gated vulnerabilities are still vulnerabilities.** Code paths gated behind an env var or config flag are reported as conditional findings with a `condition` field. The flag controls when the path is exploitable, not whether the code is vulnerable.
 
 **Taint crosses process and language boundaries.** The pipeline tracks taint across async queue hops (Celery, RQ) and across the Python→TypeScript boundary (stored data rendered as HTML). Single-language scanners miss both of these paths.
+
+**Absence-based detection alongside presence-based taint.** IDOR (missing ownership check) is detected by asking "is the resource owner compared against the caller?" — not by tracing a dangerous data flow. This pattern is embedded into Q2 of each language skill so it runs on every handler without a separate pipeline stage.
+
+**Supply chain is a first-class concern.** config-audit scans Dockerfiles, CI pipeline files, and reverse-proxy config files (`.cfg`, `.ini`) in addition to runtime environment files. find-vulns-python checks application code that downloads and executes external binaries without hash verification.
 
 ---
 

@@ -73,13 +73,55 @@ For every file in the scan queue, read the full file, then for each method ask:
 
 **Q1 — Taint:** What enters this method? What sinks are in the body? Does any tainted value reach a sink without effective sanitization?
 
-**Q2 — Authorization:** Does this method perform a privileged operation? Is the authorization check based on session state (secure) or a client-supplied header/cookie (insecure)?
+**Q2 — Authorization and Ownership (IDOR):** Does this method perform a privileged operation?
+
+*Part A — Identity source:* Is the authorization check based on server-side session state (`session.getAttribute("user")`, Spring Security `@PreAuthorize`) or on a client-supplied value (cookie, header, request parameter)? Client-supplied = auth bypass risk.
+
+*Part B — Ownership verification (IDOR):* Does this method accept a resource identifier (path variable `{id}`, `@RequestParam("projectId")`, or body field used as a DB lookup key) and perform a read, update, or delete on that resource?
+
+If yes, check: is the resource's owner field compared against the authenticated session user at any point in this method or the service it calls?
+
+**Ownership IS verified if:**
+- `if (!resource.getOwner().equals(currentUser)) throw new ResponseStatusException(FORBIDDEN)`
+- Spring Data query scoped by owner: `repository.findByIdAndOwner(id, currentUser)`
+- `@PreAuthorize("@resourceService.isOwner(#id, authentication.name)")`
+
+**Ownership is NOT verified if:**
+- Only authentication exists: `if (session.getAttribute("user") == null) return 401` — logged in ≠ owns this resource
+- Only a role check: `if (!user.hasRole("ADMIN"))` — role ≠ ownership of a specific resource instance
+- Resource fetched by ID and returned with no owner comparison
+
+Flag as IDOR (CWE-639) at critical severity for destructive operations, high for private data access, medium for non-sensitive cross-tenant reads.
 
 **Q3 — Crypto:** Does this method hash or compare passwords/tokens? Is the algorithm modern (bcrypt, argon2, PBKDF2)? Is a random salt used?
 
 **Q4 — Sensitive data in logs:** Does this method log passwords, tokens, or keys?
 
 **Q5 — Null safety:** Does a user-triggered lookup return null that is used without a null check?
+
+**Q6 — Outbound data leakage into responses or logs:**
+- `response.getWriter().write(e.getMessage())` or `ResponseEntity.body(e.toString())` — raw exception detail sent to caller (CWE-209)
+- `response.setHeader(key, internalHeaderValue)` forwarding internal service headers (upstream auth tokens, internal host names) verbatim to the client
+- `log.info("token={}", token)` or `log.debug("password={}", password)` — credentials written unconditionally to log output (CWE-532)
+- Internal file paths or stack traces in `ResponseStatusException` message exposed to external callers
+
+Flag at medium severity (CWE-209 for responses, CWE-532 for logs).
+
+**Q7 — Dead defensive code (security function never wired up):**
+
+Scan for methods named `sanitize*`, `validate*`, `guard*`, `check*`, `filter*`, `isSafe*`, `redact*` in this file and across `files[]` from crawl-output.json. For each security-named method: search entry_point and service files for callers. If a function has zero production callers:
+- Flag at medium severity, confidence 0.90
+- Note: "Method `X` in `Y` implements a security control but is never called — one call at the unprotected site would close the gap"
+- Spring: also look for `@PreAuthorize` annotations that are defined on base classes but not applied on overriding methods in concrete controllers
+
+**Q8 — Resource exhaustion (user controls computation bounds):**
+- `new byte[userSize]` or `new int[userCount]` where size comes from a request param with no upper bound cap (CWE-400)
+- `for (int i = 0; i < userCount; i++)` with no `Math.min(userCount, MAX)` guard (CWE-400)
+- `Pattern.compile(userPattern)` where `userPattern` is request-derived — ReDoS via complex user-controlled regex (CWE-1333)
+- `ZipEntry.getSize()` used to allocate a byte array without verifying against an independent limit — zip-bomb via falsified entry headers (CWE-409)
+- `IOUtils.toByteArray(inputStream)` or `stream.readAllBytes()` on a user-supplied stream with no size guard (CWE-400)
+
+Flag at medium severity. Fix: always cap allocations with `Math.min(userSize, MAX_ALLOWED_BYTES)` and never compile user-supplied strings as `Pattern`.
 
 ---
 

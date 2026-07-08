@@ -85,6 +85,7 @@ Taint propagates through: variable assignment, template literals, object spread,
 | Prototype pollution | `Object.assign(target, userControlledObj)` or deep merge where keys are not validated — can corrupt `Object.prototype` | Application logic bypass |
 | Mapping library HTML injection | `marker.bindPopup(tainted)`, `layer.setPopupContent(tainted)`, `L.popup().setContent(tainted)` (Leaflet); `new mapboxgl.Popup().setHTML(tainted)` (Mapbox) — mapping libraries render popup content as raw HTML by default | XSS via map popup — user-supplied location names, coordinates, or metadata stored in DB and rendered in browser without sanitization |
 | CSS-as-HTML injection | `styleElement.innerHTML = userCss` where `styleElement` is a `<style>` DOM node — assigning user-controlled CSS to a style element's innerHTML allows `</style>` tag injection, which closes the style block and renders arbitrary HTML. A payload like `</style><img src=x onerror=alert(1)>` executes JavaScript. | Stored XSS — dashboard CSS, theme CSS, user-defined styles stored in DB and injected at render time |
+| Outbound response leakage (Node/Express) | `res.json({ error: err.message })` returning raw exception message; `res.set(upstreamResponse.headers)` forwarding internal service headers to client; `console.log(process.env.SECRET_KEY)` in request handler; `res.setHeader("X-Internal-Path", filePath)` leaking server file paths | Internal system information exposed to external clients — stack traces, credentials, internal hostnames |
 
 ### Sanitization that breaks the chain
 
@@ -118,7 +119,25 @@ For every file in the scan queue, read the full file, then ask:
 
 **Q1 — Taint (injection / XSS):** What are the inputs (URL params, form data, API responses, DOM sources)? What sinks are in the body? Does any tainted value reach a DOM-writing sink, eval, or redirect without effective sanitization?
 
-**Q2 — Authorization (client-side):** Does this component control visibility of privileged features based on a client-stored value (localStorage, cookie, URL param)? Client-side-only auth checks are always bypassable.
+**Q2 — Authorization and Ownership (IDOR):**
+
+*Part A — Client-side auth bypass:* Does this component control visibility of privileged features based on a client-stored value (localStorage, cookie, URL param)? Client-side-only auth checks are always bypassable.
+
+*Part B — Server-side ownership check (Node/Express handlers):* Does this handler accept a resource identifier (`id`, `projectId`, `userId`, `docId`, or any `*Id` / `*Uuid` path or query param) and perform a DB operation with it?
+
+If yes, check: is the resource's owner field compared against the authenticated session's identity before or after the operation?
+
+**Ownership IS verified if:**
+- `if (resource.ownerId !== req.user.id) return res.status(403).json(...)` 
+- ORM query scoped by owner: `.findOne({ where: { id, ownerId: req.user.id } })`
+- Prisma: `prisma.project.findFirst({ where: { id, ownerEmail: session.user.email } })`
+
+**Ownership is NOT verified if:**
+- Only authentication middleware runs: `if (!req.user) return 401` — authenticated ≠ owns this resource
+- Only a role check: `if (req.user.role !== 'admin')` — role ≠ ownership of a specific instance
+- Resource is fetched by ID and returned with no owner comparison
+
+Flag as IDOR (CWE-639) when a resource ID parameter is used in a DB operation with no ownership comparison. Severity: critical for destructive operations; high for private data reads or writes; medium for non-sensitive cross-tenant access.
 
 **Q3 — External requests:** Does this component or Node handler fetch from a URL that is partially or fully user-controlled? Is the URL scheme and host validated before the request?
 
@@ -131,6 +150,39 @@ For every file in the scan queue, read the full file, then ask:
 - returns `false` or throws — the function is safe on the exception path
 
 Flag catch-true as CWE-601 (open redirect) or CWE-918 (SSRF) at medium severity with confidence 0.80.
+
+**Q7 — Outbound data leakage into responses or logs:** Does this handler or component leak sensitive system information back to the client or to logs?
+
+Look for (Node/Express server-side):
+- `res.json({ error: err.message })` or `res.send(err.stack)` — raw exception details returned to caller (CWE-209)
+- `res.set(proxyResponse.headers)` or `res.setHeader(key, internalValue)` forwarding internal service headers (auth tokens, trace IDs, upstream hostnames) verbatim to the external client
+- `console.log(process.env.API_KEY)` or `console.log(req.headers.authorization)` in a request handler — tokens or credentials written to stdout unconditionally
+- `res.setHeader("X-Log-File", logFilePath)` — internal file paths in response headers
+
+Look for (React client-side):
+- `console.log(token)` or `console.log(apiResponse)` where `apiResponse` may contain secrets — visible to any user with browser devtools
+- Storing JWTs or API keys in `localStorage` and rendering them in the DOM (exposure to XSS)
+
+Flag with CWE-209 (error message information exposure) at medium severity when exceptions are returned raw; CWE-200 (information exposure) for internal paths and headers in responses.
+
+**Q8 — Dead defensive code (security function never wired up):** Are security utility functions defined but never called on production paths?
+
+Scan the file and cross-reference `files[]` from crawl-output.json for functions named:
+`sanitize*`, `validate*`, `guard*`, `check*`, `filter*`, `isSafe*`, `redact*`, `escape*`, `purify*`
+
+For each: search all entry_point and component files in crawl-output.json for calls to that function. If zero callers exist on production code paths:
+- Flag at medium severity, confidence 0.90 (CWE-1041 / CWE-116)
+- Note: "Function `X` exists in `Y` but is never called — adding one call at the unprotected render site would close the gap"
+
+**Q9 — Resource exhaustion (user controls computation bounds in Node):**
+
+Look for:
+- `fs.readFileSync(userFile)` or `fs.readFile(userFile)` with no size cap before reading — unbounded memory allocation (CWE-400)
+- `for (let i = 0; i < userCount; i++)` or `Array(userCount).fill(...)` with no `Math.min(userCount, MAX)` guard (CWE-400)
+- `new RegExp(userPattern)` or `new RegExp(userPattern, flags)` where `userPattern` is request-derived — user-controlled regex evaluated against large corpus is a ReDoS vector (CWE-1333)
+- Streaming responses: `res.write()` in a loop driven by user-controlled iteration count with no back-pressure check (CWE-400)
+
+Flag at medium severity. Fix: always cap loops with `Math.min(userCount, MAX_ALLOWED)` and never compile user-supplied strings as regex patterns.
 
 ---
 
@@ -161,6 +213,7 @@ Flag catch-true as CWE-601 (open redirect) or CWE-918 (SSRF) at medium severity 
 | Path traversal (Node fs) | CWE-22 | A01:2021 |
 | Open redirect | CWE-601 | A01:2021 |
 | Client-side auth bypass | CWE-285 | A01:2021 |
+| IDOR / missing ownership check | CWE-639 | A01:2021 |
 | Prototype pollution | CWE-1321 | A03:2021 |
 | Hardcoded credentials in client | CWE-798 | A02:2021 |
 | Sensitive data in client bundle | CWE-200 | A02:2021 |

@@ -28,6 +28,9 @@ Walk `<repo-path>`. Collect these files:
 - `config/environments/*.rb` (Rails)
 - `appsettings.json`, `appsettings.Production.json` (.NET)
 - `config.json`, `config.example.json`, `config*.json`, `*.config.json` — JSON config files (websocket servers, queue workers, sidecars)
+- `*.cfg`, `*.conf`, `*.ini` — reverse proxy and sidecar config files (oauth2-proxy, nginx, gunicorn, uwsgi, supervisor)
+- `Dockerfile`, `Dockerfile.*`, `*.dockerfile` — build-time supply chain
+- `.gitlab-ci.yml`, `.github/workflows/*.yml`, `Jenkinsfile`, `*.pipeline.yml` — CI pipeline files
 
 If none found, note it in warnings and stop.
 
@@ -49,6 +52,9 @@ Look for env vars that gate security-sensitive features. Flag any that are enabl
 | `*_ENV=development`, `*_ENVIRONMENT=development`, `SUPERSET_ENV=development`, `NODE_ENV=development` in server-side services | Framework environment flag — enables dev behaviors even when `DEBUG` is separately false |
 | `TESTING=true`, `TEST_MODE=1` | Test modes often disable security middleware |
 | `*_ENABLED=true` where the var name contains `ADMIN`, `SUPERUSER`, `INTERNAL`, `UNSAFE` | Administrative/unsafe features enabled |
+| `OIDC_NONCE_ENABLED=false`, `OIDC_SKIP_NONCE=true`, `oidc_skip_nonce_enabled=true` | OIDC nonce validation disabled — allows token replay attacks with captured authorization codes (CWE-287) |
+| `*MOCK_EMAIL*=<any value>`, `*_DEV_AUTH*=<any value>`, `*_FAKE_USER*=<any value>` | Developer mock authentication set — if there is no production guard in code, any user can authenticate as any email (CWE-290). Flag even when the variable is set to an empty string — presence alone enables the bypass path. |
+| `CORS_ORIGIN=*` or `CORS_ORIGINS=*` **combined with** `CORS_ALLOW_CREDENTIALS=true` or `ACCESS_CONTROL_ALLOW_CREDENTIALS=true` | CORS wildcard + credentials: browser will send cookies to any cross-origin requester (CWE-942). The wildcard alone is medium risk; the combination is high because session cookies are exfiltrated. |
 
 For each flagged env var, report a conditional finding: "This feature is enabled and exploitable only when this env var is set. Verify that the backend is not directly reachable when this flag is on."
 
@@ -78,6 +84,29 @@ Check these patterns:
 
 ---
 
+## Step 2d — Analyze `.cfg`, `.conf`, `.ini` files
+
+These files use `key = value` or `key=value` format (INI-style), not shell variable export syntax. Apply the same checks as Step 2b/2c but match against lowercase key names.
+
+**Secret variable names to flag (case-insensitive, INI key format):**
+- `cookie_secret`, `cookie_secret_hmac`, `cookie_name`, `jwt_secret`, `session_secret`, `api_key`, `token_secret`, `signing_key`, `private_key`, `hmac_secret`
+
+**oauth2-proxy.cfg specific patterns:**
+```ini
+cookie_secret = "short_or_placeholder"   # flag if value < 32 chars or matches placeholder patterns
+provider = "github"                       # note auth provider for context
+skip_auth_regex = ["/health"]             # if set to broader patterns, flag as auth bypass risk
+email_domains = ["*"]                     # wildcard email domain — anyone with a valid OIDC token can authenticate
+```
+
+**For each key found:**
+1. Apply the same placeholder/length checks as Step 2b: flag values < 32 chars, values containing `test`, `change`, `example`, `dev`, `secret` as substrings
+2. `email_domains = ["*"]` — flag as medium risk: no domain restriction means any user authenticated via the OIDC provider can log in (CWE-284)
+3. `skip_auth_regex` patterns broader than `/health` or `/metrics` — flag as auth bypass risk
+4. Apply deployment context classification (Step 4b) the same as for .env files
+
+---
+
 ## Step 3 — Analyze docker-compose files
 
 For each compose file, read it fully and check:
@@ -102,7 +131,41 @@ If a reverse proxy service (nginx, caddy, traefik) is present in the same compos
 - `privileged: true` — container runs with root capabilities on the host
 - `network_mode: host` — bypasses Docker network isolation
 
-### 3c — Secrets in compose file (not in .env)
+### 3c — Supply chain risks in Dockerfiles
+
+For each `Dockerfile` or `Dockerfile.*`, read it fully and check:
+
+**Unpinned external code execution:**
+
+| Pattern | Risk | Example |
+|---|---|---|
+| `RUN curl ... \| bash` or `RUN curl ... \| sh` without hash verification | Remote script executed at build time — if CDN/DNS is compromised, arbitrary code runs as root inside the image | `RUN curl -fsSL https://dot.net/v1/dotnet-install.sh \| bash` |
+| `RUN wget ... -O- \| bash` | Same risk via wget | `RUN wget -qO- https://... \| bash` |
+| `RUN git clone <url>` without subsequent `RUN git checkout <commit-sha>` | Any new commit pushed to the upstream branch is silently pulled into the next build — supply chain poisoning | `RUN git clone https://github.com/ggerganov/whisper.cpp` |
+| `COPY *.whl .` or binary files committed to the repo and `pip install`ed | Binary wheel without source — cannot audit what the binary does | `COPY vendor/mylib-1.0-py3-none-any.whl .` |
+| `RUN pip install git+https://github.com/org/repo` without `@<commit-sha>` | Mutable git reference — HEAD changes silently | `RUN pip install git+https://github.com/org/repo.git` |
+| External binary downloaded with `curl -o binary` then `chmod +x binary && ./binary` without signature verification | Executable with no integrity check | `RUN curl -L https://releases.example.com/tool -o tool && chmod +x tool && ./tool` |
+| `FROM <image>:latest` or `FROM <image>` without digest pin (`@sha256:...`) | Base image can change between builds silently | `FROM python:3.11` vs safe: `FROM python:3.11@sha256:abc123...` |
+
+Flag each as a supply chain finding with:
+- `severity`: critical if the unverified code runs as root or at build time; high otherwise
+- `cwe`: CWE-494 (Download of Code Without Integrity Check) or CWE-829 (Inclusion of Functionality from Untrusted Control Sphere)
+- `deployment_context`: `production_config` (Dockerfiles are always build artifacts, not templates)
+
+### 3d — CI pipeline injection
+
+For each CI file (`.gitlab-ci.yml`, `.github/workflows/*.yml`, `Jenkinsfile`):
+
+| Pattern | Risk |
+|---|---|
+| Unquoted variable in shell command: `- run: my-tool ${{ github.event.pull_request.title }}` | Attacker-controlled PR title injects shell commands into CI |
+| GitLab CI unquoted variable: `- ${CI_COMMIT_BRANCH}` in a `script:` block without quoting | Branch name containing `;`, `&&`, or `\`cmd\`` executes arbitrary commands |
+| `actions/checkout` with `ref: ${{ github.event.pull_request.head.ref }}` and subsequent `run:` using repo files | Malicious PR can inject code that runs in the CI context with repo secrets |
+| Secrets printed in CI log: `echo $SECRET` or `run: echo "Token: $TOKEN"` | Secret exposed in CI log output |
+
+Flag CI injection as CWE-78 (command injection) at high severity.
+
+### 3e — Secrets in compose file (not in .env)
 
 If `environment:` block hard-codes values like `SECRET_KEY: mysecret` instead of `${SECRET_KEY}`, flag as secret in version-controlled file.
 
@@ -225,6 +288,13 @@ Append to `findings.json` (create if not exists). Use the same schema as find-vu
 | Backend port exposed bypassing proxy | CWE-284 | A01:2021 |
 | CSRF protection disabled | CWE-352 | A01:2021 |
 | Insecure TLS configuration | CWE-295 | A02:2021 |
+| Download without integrity check (supply chain) | CWE-494 | A08:2021 |
+| Untrusted code inclusion (supply chain) | CWE-829 | A08:2021 |
+| CI pipeline command injection | CWE-78 | A03:2021 |
+| OIDC nonce disabled / token replay | CWE-287 | A07:2021 |
+| CORS wildcard + credentials | CWE-942 | A05:2021 |
+| Mock auth bypass without production guard | CWE-290 | A07:2021 |
+| Overly permissive email domain / auth scope | CWE-284 | A01:2021 |
 
 ---
 
@@ -243,9 +313,13 @@ Append to `findings.json` (create if not exists). Use the same schema as find-vu
 config-audit complete.
   Repo             : <repo-path>
   Config files read: <N>
+  Dockerfiles read : <N>
+  CI files read    : <N>
   Findings         : <total> (<critical> critical / <high> high / <medium> medium / <low> low)
   Dangerous flags  : <list of enabled feature flags>
   Weak secrets     : <N> secret vars flagged
   Port exposure    : <N> backend ports exposed
+  Supply chain     : <N> unpinned/unverified build-time dependencies
+  CI injection     : <N> unquoted variables in CI scripts
   Output           : findings.json (appended)
 ```

@@ -58,6 +58,40 @@ This is a **prompt injection → stored XSS** path. Key differences from direct 
 
 **Confidence for LLM taint findings:** 0.60–0.70 (the static code path is confirmed; whether the LLM actually emits a payload is probabilistic).
 
+### Multi-hop prompt injection via RAG retrieval
+
+A third class of cross-language finding involves a retrieval-augmented generation (RAG) pipeline where adversarial content travels through a vector store or document store before reaching the LLM context:
+
+```
+Attacker submits malicious document / repo file / message
+    ↓  [Python backend — ingestion pipeline]
+Content chunked, embedded, stored in vector DB (Chroma, Pinecone, pgvector, Weaviate)
+    ↓  [Vector DB — semantic retrieval]
+Adversarial chunk retrieved because it is semantically similar to a user's query
+    ↓  [Python backend — RAG prompt assembly]
+Retrieved chunk injected into LLM context as "trusted" retrieved knowledge
+    ↓  [LLM — influenced by injected instructions in the chunk]
+LLM output shaped by adversarial instructions (exfiltrate data, produce harmful content, trigger downstream action)
+    ↓  [Backend action / frontend render]
+Output stored or rendered without sanitization
+```
+
+This is a **multi-hop prompt injection** path. Key differences from single-hop LLM injection:
+- The injection payload travels through storage and retrieval — it is not in the current user's request
+- The adversarial content was submitted by a different user or at a different time (persistent)
+- The RAG system treats retrieved content as authoritative context — it is not sandboxed
+- Detection requires identifying: (1) where user content enters the vector store, (2) how retrieved content is assembled into prompts, (3) whether the assembled prompt distinguishes between trusted instructions and retrieved context
+
+**When to create a multi-hop RAG injection finding:**
+1. User-submitted content (documents, code, messages) is embedded and stored in a vector DB without a content policy or sanitization step
+2. A retrieval function assembles a prompt by concatenating retrieved chunks alongside system instructions without a separator or trust boundary marker
+3. The assembled prompt is passed to an LLM whose output influences an action (file write, API call, response to another user, frontend render)
+4. No output filtering or intent classification is applied between the LLM response and the downstream action
+
+**Confidence for RAG injection findings:** 0.50–0.65 (the code path is confirmed; exploitation requires the adversarial chunk to be retrieved, which depends on semantic similarity at query time — not statically verifiable).
+
+Include a `role: "rag_retrieval"` step in `taint_path` for the vector store hop, in addition to `role: "llm_transformation"` for the LLM step.
+
 ---
 
 ## Step 1 — Load inputs
