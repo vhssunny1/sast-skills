@@ -31,6 +31,11 @@ Walk `<repo-path>`. Collect these files:
 - `*.cfg`, `*.conf`, `*.ini` — reverse proxy and sidecar config files (oauth2-proxy, nginx, gunicorn, uwsgi, supervisor)
 - `Dockerfile`, `Dockerfile.*`, `*.dockerfile` — build-time supply chain
 - `.gitlab-ci.yml`, `.github/workflows/*.yml`, `Jenkinsfile`, `*.pipeline.yml` — CI pipeline files
+- `**/grafana/datasource*.yml`, `**/grafana/**/*.yml`, `**/dashboards/*.json` — Grafana datasource and dashboard configs
+- `**/tempo/*.yml`, `**/tempo/**/*.yml` — Tempo (distributed tracing) configs
+- `**/prometheus/*.yml`, `**/alertmanager/*.yml` — Prometheus and Alertmanager configs
+- `**/pyproject.toml`, `**/setup.cfg`, `**/setup.py` — Python package manifests at any depth (nested packages, workspace members)
+- `**/go.mod` — Go module manifests at any depth
 
 If none found, note it in warnings and stop.
 
@@ -124,6 +129,26 @@ ports:
 
 If a reverse proxy service (nginx, caddy, traefik) is present in the same compose file AND the backend also has a mapped port, flag the backend port as "proxy bypass risk" — an attacker with host access can reach the backend directly, bypassing the proxy's auth/TLS.
 
+### 3a (continued) — Datastore without authentication
+
+For each service in the compose file whose image name contains `redis`, `postgres`, `mysql`, `mariadb`, `mongodb`, `mongo`, `memcached`, or `elasticsearch`:
+
+Check whether the service has a password environment variable set:
+- Redis: `REDIS_PASSWORD`, `requirepass`
+- Postgres: `POSTGRES_PASSWORD`
+- MySQL/MariaDB: `MYSQL_ROOT_PASSWORD`, `MYSQL_PASSWORD`
+- MongoDB: `MONGO_INITDB_ROOT_PASSWORD`
+- Elasticsearch: `ELASTIC_PASSWORD`, `xpack.security.enabled`
+
+Flag as high severity (CWE-306) when:
+- The service has a mapped host port (exposed to host network), AND
+- No password environment variable is set in the `environment:` block
+
+Flag as medium severity when the service has no exposed port but also has no password (reachable within the Docker network by all co-located services).
+
+Example finding evidence: `redis: image: redis:7 — no REDIS_PASSWORD set, port 6379 exposed to host`
+Fix hint: Add `command: redis-server --requirepass "${REDIS_PASSWORD}"` and set `REDIS_PASSWORD` in `.env`.
+
 ### 3b — Dangerous build/runtime flags
 
 - `skip_frontend_build: "true"` (or similar) — acceptable if intentional, but note it
@@ -146,6 +171,10 @@ For each `Dockerfile` or `Dockerfile.*`, read it fully and check:
 | `RUN pip install git+https://github.com/org/repo` without `@<commit-sha>` | Mutable git reference — HEAD changes silently | `RUN pip install git+https://github.com/org/repo.git` |
 | External binary downloaded with `curl -o binary` then `chmod +x binary && ./binary` without signature verification | Executable with no integrity check | `RUN curl -L https://releases.example.com/tool -o tool && chmod +x tool && ./tool` |
 | `FROM <image>:latest` or `FROM <image>` without digest pin (`@sha256:...`) | Base image can change between builds silently | `FROM python:3.11` vs safe: `FROM python:3.11@sha256:abc123...` |
+| `USER root` instruction (or absence of any `USER` instruction) in the final stage | Container runs as root inside the container — if the process is compromised, the attacker has root on the host if volumes are mounted or `privileged: true` is set | `USER root` or no `USER` in final `FROM` stage |
+
+**USER root / missing USER check:**
+Read each Dockerfile. If the final `FROM` stage contains no `USER` instruction (other than `USER root`), or explicitly sets `USER root`, flag as medium severity (CWE-250 — Execution with Unnecessary Privileges). Severity escalates to high if the compose file also sets `privileged: true` for this service.
 
 Flag each as a supply chain finding with:
 - `severity`: critical if the unverified code runs as root or at build time; high otherwise
@@ -162,6 +191,11 @@ For each CI file (`.gitlab-ci.yml`, `.github/workflows/*.yml`, `Jenkinsfile`):
 | GitLab CI unquoted variable: `- ${CI_COMMIT_BRANCH}` in a `script:` block without quoting | Branch name containing `;`, `&&`, or `\`cmd\`` executes arbitrary commands |
 | `actions/checkout` with `ref: ${{ github.event.pull_request.head.ref }}` and subsequent `run:` using repo files | Malicious PR can inject code that runs in the CI context with repo secrets |
 | Secrets printed in CI log: `echo $SECRET` or `run: echo "Token: $TOKEN"` | Secret exposed in CI log output |
+| Unquoted `$VARIABLE` in GitHub Actions `run:` block: `run: ./deploy.sh $BRANCH_NAME` where `BRANCH_NAME` comes from `github.head_ref` or similar | Branch name with shell metacharacters executes arbitrary commands in the CI runner | CWE-78 |
+| Unquoted `$CI_*` variable in GitLab CI `script:` block: `- ./build.sh $CI_COMMIT_REF_NAME` | Same risk — GitLab CI variables expanded by shell | CWE-78 |
+| GitHub Actions `env:` block setting a variable from a github context value without quoting in subsequent `run:`: `env: TITLE: ${{ github.event.issue.title }}` then `run: echo $TITLE` | Issue title set as env var then used unquoted — shell expansion | CWE-78 |
+
+**Unquoted variable rule:** Any `$VARIABLE` or `${VARIABLE}` that (a) derives from attacker-controlled input (PR title, branch name, issue body, commit message, tag name) and (b) appears unquoted in a shell `run:` or `script:` block is a CI injection vector. The existing `${{ github.* }}` check covers direct GitHub context interpolation; this check covers indirect injection through env vars set from those contexts.
 
 Flag CI injection as CWE-78 (command injection) at high severity.
 

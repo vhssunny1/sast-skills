@@ -29,6 +29,8 @@ Analyze files in this priority order:
 
 Within each tier, read files in descending `security_priority` order (from crawl-output.json). Priority 5 files (sandbox setup, exec/eval, subprocess) are read before priority 3 files (HTTP calls, file I/O).
 
+**Coverage guarantee:** Every file with `security_priority` ≥ 2 (from crawl-output.json) MUST receive at least one full read and analysis pass, regardless of its role tier. Files are processed tier-by-tier and within-tier by descending `security_priority`, but the scan does NOT stop at any tier boundary — all priority ≥ 2 files are reached. Only priority 1 files (boilerplate, migrations, test fixtures) may be skipped. Track and report `files_attempted` and `files_in_manifest` in the output (see Step 6).
+
 ---
 
 ## Step 3 — Sources, sinks, and sanitization
@@ -311,6 +313,8 @@ Write to `findings.json` in the current working directory. Overwrite if exists.
   "language": "python",
   "crawl_input": "./crawl-output.json",
   "total_findings": 0,
+  "files_attempted": 42,
+  "files_in_manifest": 45,
   "findings_by_severity": { "critical": 0, "high": 0, "medium": 0, "low": 0 },
   "findings": [
     {
@@ -334,7 +338,9 @@ Write to `findings.json` in the current working directory. Overwrite if exists.
       "condition": null
     }
   ],
-  "skipped_files": [],
+  "files_skipped": [
+    { "path": "migrations/env.py", "reason": "security_priority 1 — boilerplate" }
+  ],
   "warnings": []
 }
 ```
@@ -359,6 +365,7 @@ Write to `findings.json` in the current working directory. Overwrite if exists.
 find-vulns-python complete.
   Repo          : <repo_path>
   Files scanned : <N> Python files
+  Files attempted : <N> / <total_in_manifest> (<skipped> skipped — priority 1 only)
   Findings      : <total> (<critical> critical / <high> high / <medium> medium / <low> low)
   Output        : findings.json
 ```
