@@ -55,7 +55,7 @@ GENERATE-DAST-TESTS (--dast only) → "How do I dynamically confirm these findin
 
 ## Input
 
-`$ARGUMENTS` format: `<repo-path> [--ground-truth <path>] [--out-dir <path>] [--skip-taint] [--skip-config-audit] [--dast]`
+`$ARGUMENTS` format: `<repo-path> [--ground-truth <path>] [--out-dir <path>] [--skip-taint] [--skip-config-audit] [--dast] [--fresh] [--resume <run-id>]`
 
 - `<repo-path>` — required. Path to the repository root (any language).
 - `--ground-truth <path>` — optional. Path to ground truth file for precision/recall.
@@ -63,14 +63,85 @@ GENERATE-DAST-TESTS (--dast only) → "How do I dynamically confirm these findin
 - `--skip-taint` — skip taint-trace (faster, higher FP rate)
 - `--skip-config-audit` — skip config-audit step (use when no .env or docker-compose files present)
 - `--dast` — optional. After scan-report, generate a DAST test script (`dast-tests.py`) from confirmed findings. Off by default.
+- `--fresh` — force a new scan even if an incomplete prior run exists for this repo. Ignores auto-resume.
+- `--resume <run-id>` — explicitly resume a specific prior run by ID (e.g. `--resume 20260722-103045`). Skips auto-detection.
 
 If no repo path provided, print usage and stop.
 
 ---
 
+## Step 0 — Auto-resume detection
+
+**Run this before anything else, unless `--fresh` was passed.**
+
+### Detection logic
+
+1. Scan all `sast-runs/*/run-log.json` files in the current directory.
+2. Filter to runs where `repo_path` matches the current `<repo-path>` argument (exact match).
+3. From those, find runs where `status` is `"failed"` or `"in_progress"` (crashed mid-run).
+4. If multiple exist, pick the most recent by `started_at`.
+5. If `--resume <run-id>` was passed, use that run directly instead of auto-detecting.
+
+### Outcomes
+
+**No incomplete run found** (or `--fresh` passed):
+→ Proceed to Step 1 as a fresh scan.
+
+**Incomplete run found:**
+
+Print:
+```
+Incomplete run detected: <run-id>  (failed at: <failed_at_step>)
+Resuming from <failed_at_step> — skipping completed steps.
+To start fresh instead: re-run with --fresh
+To target a specific run: re-run with --resume <run-id>
+```
+
+Then:
+1. Set `RESUMING = true`, `RESUME_RUN_DIR = sast-runs/<run-id>/`
+2. Read the prior `run-log.json` — load `steps[]` to know which steps already have `status: "completed"`
+3. Restore the **last good artifact** to the working directory using this table:
+
+| `failed_at_step` | Artifact to restore | Restore as |
+|---|---|---|
+| `scan-report` | `<run-dir>/findings-validated.json` | `findings.json` |
+| `generate-dast-tests` | `<run-dir>/findings-validated.json` | `findings.json` |
+| `validate-findings` | `<run-dir>/findings-traced.json` | `findings.json` |
+| `taint-trace` | `<run-dir>/findings-cross-lang.json` (if exists) or `findings-raw.json` | `findings.json` |
+| `cross-language-taint` | `<run-dir>/findings-raw.json` | `findings.json` |
+| `find-vulns` | `<run-dir>/findings-after-config-audit.json` (if exists) or nothing | `findings.json` |
+| `config-audit` | — (no findings yet) | — |
+| `crawl` or `detect-language` | — (start from that step, no artifact to restore) | — |
+
+Also restore `crawl-output.json` from `<run-dir>/crawl-output.json` if the failed step is `find-vulns` or later.
+
+4. Continue to Step 1 — but Step 1 will re-use the prior `run-manifest.json` and append to the prior `run-log.json` rather than creating new ones.
+
+### Run-log behavior when resuming
+
+When `RESUMING = true`:
+- **Do not create a new `run-log.json`**. Load the prior one from `<run-dir>/run-log.json`.
+- Update its top-level `status` back to `"in_progress"` and set `resumed_at: "<ISO 8601>"`.
+- For each step that already has `status: "completed"` in the prior log — do NOT re-run it. Write a log entry:
+  ```json
+  { "step": "<name>", "status": "skipped", "skip_reason": "already completed in prior run" }
+  ```
+- Continue appending new step entries from the failed step onward.
+- At finalization (Step 8), set `status: "success"` and `completed_at` as normal.
+
+---
+
 ## Step 1 — Initialize run
 
-Create output directory: `./sast-runs/YYYYMMDD-HHMMSS/`
+**If `RESUMING = true`:** skip creating new files. Re-use `<RESUME_RUN_DIR>` as `<out-dir>`. Update `run-log.json` top-level: set `status: "in_progress"`, add `resumed_at: "<ISO 8601>"`. Print:
+```
+SAST full scan resuming.
+  Repo    : <repo-path>
+  Run dir : <out-dir>  (prior run)
+```
+Then skip to Step 2.
+
+**If fresh scan:** Create output directory `./sast-runs/YYYYMMDD-HHMMSS/`
 
 Write `run-manifest.json`:
 ```json
@@ -83,7 +154,7 @@ Write `run-manifest.json`:
 }
 ```
 
-Write `<out-dir>/run-log.json` (the structured audit log for this run):
+Write `<out-dir>/run-log.json`:
 ```json
 {
   "run_id": "YYYYMMDD-HHMMSS",
@@ -94,6 +165,15 @@ Write `<out-dir>/run-log.json` (the structured audit log for this run):
   "steps": []
 }
 ```
+
+### Resume skip rule (applies to every step below)
+
+When `RESUMING = true`, before executing any step: check whether that step already has `status: "completed"` in the loaded prior `run-log.json`.
+
+- **If already completed:** do not re-run the skill. Log `status: "skipped"`, `skip_reason: "already completed in prior run"`. Move to the next step.
+- **If failed or missing:** this is the step to resume from — run it normally.
+
+This check takes priority over all other skip conditions (e.g. `--skip-taint` is still honoured, but a step that already completed is never re-run regardless).
 
 ### Run-log protocol (apply at every step below)
 
@@ -425,6 +505,7 @@ Print final summary:
 ```
 SAST full scan complete.
   Run dir   : <out-dir>
+  Resumed   : yes (from <failed_at_step>)  ← only print this line when RESUMING = true
   Language  : <language(s)> (<framework(s)>)
 
   Execution groups:
@@ -510,6 +591,15 @@ Then merge to `crawl-output.json` / `findings.json` after the group completes.
 ## Invocation examples
 
 ```bash
+# Normal run — auto-resumes if a prior incomplete run exists for this repo
+/sast-full-scan my-repo
+
+# Force fresh scan, ignore any incomplete prior run
+/sast-full-scan my-repo --fresh
+
+# Resume a specific prior run by ID (when multiple incomplete runs exist)
+/sast-full-scan my-repo --resume 20260722-103045
+
 # Java repo with precision/recall
 /sast-full-scan dvja --ground-truth dvja-ground-truth.MD
 
