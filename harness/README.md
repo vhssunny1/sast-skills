@@ -71,72 +71,147 @@ INFO:     Uvicorn running on http://0.0.0.0:8000
 
 ---
 
+## Accessing from the web browser
+
+### Same machine
+
+Open your browser and go to:
+
+```
+http://localhost:8000
+```
+
+### From another machine on the same network
+
+Find the IP address of the machine running the harness:
+
+```powershell
+# Windows
+ipconfig
+# look for IPv4 Address under your active adapter e.g. 192.168.1.42
+```
+
+```bash
+# macOS / Linux
+hostname -I   # or: ifconfig | grep "inet "
+```
+
+Then open on any browser on any device on the same network:
+
+```
+http://192.168.1.42:8000
+```
+
+Share this URL with teammates — they can log in and trigger scans from their own browser without installing anything.
+
+### Changing the port
+
+If port 8000 is taken, set a different one before starting:
+
+```powershell
+# Windows PowerShell
+$env:HARNESS_PORT = "9000"
+python harness/harness.py
+# → accessible at http://localhost:9000
+```
+
+```bash
+# bash/zsh
+HARNESS_PORT=9000 python harness/harness.py
+```
+
+---
+
 ## Using the Web UI
 
-### 1. Open the browser
+### Step 1 — Open the browser
 
-Navigate to `http://localhost:8000`
+Navigate to `http://localhost:8000` (or the network URL above if accessing from another machine).
 
-### 2. Log in
+### Step 2 — Log in
 
-Enter the username (`admin` by default) and the password you set in `HARNESS_PASSWORD`.
+You will see a login screen. Enter:
+- **Username**: `admin` (or whatever you set in `HARNESS_USERNAME`)
+- **Password**: the value you set in `HARNESS_PASSWORD`
 
-### 3. Start a scan
+Click **Sign in**. Your session lasts 24 hours before you need to log in again.
 
-Paste a Git repository URL into the **Git repository URL** field:
+### Step 3 — Paste a Git URL and start a scan
+
+In the **Git repository URL** field, paste the HTTPS or SSH URL of any repo:
 
 ```
 https://github.com/juice-shop/juice-shop.git
-https://github.com/your-org/your-repo.git
+https://github.com/your-org/your-private-repo.git
+git@github.com:your-org/your-repo.git
 ```
 
-Select any options:
+> **Note:** For private repos over HTTPS, include credentials in the URL:
+> `https://username:token@github.com/org/repo.git`
+> For SSH, make sure the server's SSH key is added to your Git host.
 
-| Option | What it does |
+Choose scan options if needed:
+
+| Option | When to use |
 |---|---|
-| Skip taint-trace | Faster scan, higher false-positive rate |
-| Skip config-audit | Skip .env / Dockerfile / CI file scanning |
-| Generate DAST tests | Also output a `dast-tests.py` script |
-| Force fresh | Ignore any incomplete prior run — always start from step 1 |
+| Skip taint-trace | Quick pass — trades accuracy for speed (~40% faster) |
+| Skip config-audit | Repo has no .env / Dockerfile / CI files |
+| Generate DAST tests | You want a `dast-tests.py` script to run against the live app |
+| Force fresh | Previous incomplete run exists but you want to start over |
 
-Click **Scan**. The repo is cloned automatically.
+Click **Scan**. The harness clones the repo automatically (or pulls latest if already cloned) and starts the pipeline.
 
-### 4. Watch live progress
+### Step 4 — Watch live progress
 
-The progress panel shows each pipeline step in real time:
+The progress panel updates in real time as each skill runs. You do not need to refresh the page.
 
 ```
-✓  detect-language      — TypeScript + Python | polyglot: yes
-⟳  crawl-python         — read_file: requirements.txt
-⟳  crawl-typescript     — read_file: package.json
-⟳  config-audit         — running...
-—  (Group 1 concurrent — all three run at the same time)
+✓  detect-language       TypeScript + Python | polyglot: yes
+⟳  crawl-python          read_file: requirements.txt          ← currently running
+⟳  crawl-typescript      read_file: package.json              ← running concurrently
+⟳  config-audit          running...                           ← running concurrently
 
-✓  find-vulns-python    — 12 findings
-✓  find-vulns-typescript — 8 findings
-—  (Group 2 concurrent)
+✓  find-vulns-python     12 findings
+✓  find-vulns-typescript  8 findings
 
-✓  taint-trace          — 17 confirmed / 3 denied
-✓  validate-findings    — 18 confirmed / 2 suppressed
-✓  scan-report          — scan-results.sarif + scan-summary.md
+✓  taint-trace           17 confirmed / 3 denied
+✓  validate-findings     18 confirmed / 2 suppressed
+✓  scan-report           scan-results.sarif + scan-summary.md
 ```
 
-### 5. Download results
+Icons:
+- `⟳` — currently running
+- `✓` — completed
+- `—` — skipped (single-language repo, or flag was set)
+- `✗` — failed (scan can be resumed next run)
 
-When the scan completes, the **Downloads** panel appears:
+### Step 5 — Download results
 
-| File | Contents |
+When the scan completes, a **Downloads** section appears at the bottom of the progress panel:
+
+| File | What it contains |
 |---|---|
-| `scan-summary.md` | Human-readable report with all findings, CVSS scores, fix hints |
-| `scan-results.sarif` | SARIF 2.1.0 — open in VS Code or upload to GitHub Security tab |
-| `findings-final.json` | Full findings JSON with taint paths and validation scores |
-| `findings-validated.json` | Findings after FP scoring, before final enrichment |
-| `run-log.json` | Structured per-step audit log — timing, findings delta, errors |
-| `dast-tests.py` | DAST test script (only if Generate DAST tests was checked) |
+| **Markdown report** | `scan-summary.md` — all findings with CVSS scores, evidence, and fix hints. Open in any Markdown viewer. |
+| **SARIF 2.1.0** | `scan-results.sarif` — import into VS Code (SARIF Viewer extension) or upload to GitHub Security tab under your repo's Security → Code scanning. |
+| **findings.json** | Full findings with taint paths, validation scores, CVSS vectors. Machine-readable. |
+| **Validated findings** | Findings after false-positive scoring, before final merge. |
+| **Run log** | `run-log.json` — per-step timing, findings delta, errors. Useful for debugging a slow or failed scan. |
+| **DAST test script** | `dast-tests.py` — only present if **Generate DAST tests** was checked. Run it against the live app: `python dast-tests.py` |
 
-### 6. View scan history
+Click any link to download directly to your machine.
 
-The left sidebar lists all prior scans with their status. Click any entry to view its step breakdown and re-download its results.
+### Step 6 — View past scans
+
+The **left sidebar** lists every scan run, newest first. Each entry shows:
+- Run ID (timestamp)
+- Repository name
+- Status badge: `complete` / `failed` / `running`
+
+Click any entry to view its step-by-step breakdown and re-download its result files. Useful when you want to compare two scans of the same repo.
+
+### Step 7 — Cancel a running scan
+
+While a scan is in progress, a **Cancel** button appears in the top-right of the progress panel. Clicking it stops the scan. The partial results are saved — the next run of the same repo will auto-resume from where it left off.
 
 ---
 
