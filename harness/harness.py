@@ -194,7 +194,7 @@ async def cancel_scan(run_id: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_ui():
-    html = (Path(__file__).parent / "static" / "index.html").read_text()
+    html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
     return HTMLResponse(html)
 
 
