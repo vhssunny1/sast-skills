@@ -11,12 +11,13 @@ Compute and persist operational and quality metrics for a completed SAST scan ru
 
 From `<run-dir>`, read:
 - `run-manifest.json` — run ID, timestamps, repo path, step list
+- `run-log.json` — structured per-step audit log (timing, findings delta, errors per step)
 - `findings-raw.json` — finding count before validation (from find-vulns)
 - `findings-validated.json` — finding count and validation breakdown (after validate-findings)
 - `findings-final.json` — final enriched findings
 - `scan-summary.md` — check if present (indicates scan-report ran)
 
-If `run-manifest.json` is missing or status is not `success`, note the incomplete run but still compute whatever metrics are available.
+If `run-manifest.json` is missing or status is not `success`, note the incomplete run but still compute whatever metrics are available. If `run-log.json` is missing (pre-dates this feature), set `step_timings: null` in the metrics record.
 
 ## Step 2 — Compute operational metrics
 
@@ -27,7 +28,24 @@ From `run-manifest.json`:
 total_duration_seconds = completed_at - started_at
 ```
 
-If individual step timestamps are present, compute per-step durations.
+### Per-step timing (from run-log.json)
+
+If `run-log.json` is present, extract `step_timings` — one entry per step in `steps[]`:
+
+```json
+{
+  "step": "<skill-name>",
+  "status": "completed" | "skipped" | "failed",
+  "duration_seconds": <integer or null>,
+  "findings_before": <integer or null>,
+  "findings_after": <integer or null>,
+  "findings_delta": <findings_after - findings_before, or null>,
+  "error": null | "<message>",
+  "notes": { <forwarded verbatim from run-log step entry> }
+}
+```
+
+Compute `findings_delta = findings_after - findings_before` for each step where both are non-null. This shows which step introduced the most findings (find-vulns) and which reduced them (validate-findings suppressing FPs).
 
 ### Finding pipeline attrition
 
@@ -122,7 +140,19 @@ Compare current run against the previous run for the same repo:
       "jsp": 0,
       "xml": 0,
       "total": 0
-    }
+    },
+    "step_timings": [
+      {
+        "step": "detect-language",
+        "status": "completed",
+        "duration_seconds": 0,
+        "findings_before": null,
+        "findings_after": null,
+        "findings_delta": null,
+        "error": null,
+        "notes": {}
+      }
+    ]
   },
   "pipeline": {
     "raw_findings": 0,
@@ -200,6 +230,11 @@ scan-metrics complete.
     Low      : <N>
 
   Coverage   : <N>/<total> files (<N>%)
+
+  Per-step timings (from run-log.json):
+    <step-name>  : <Ns> — <findings_delta> findings (<status>)
+    ...
+    (omit if run-log.json absent)
 
   Trends vs previous run:
     Finding delta     : <+N/-N> (or "first run")

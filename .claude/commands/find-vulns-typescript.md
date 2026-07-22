@@ -218,6 +218,58 @@ Flag at medium severity. Fix: always cap loops with `Math.min(userCount, MAX_ALL
 | Hardcoded credentials in client | CWE-798 | A02:2021 |
 | Sensitive data in client bundle | CWE-200 | A02:2021 |
 
+**CVSS 3.1 scoring** — For every finding, assign `cvss_vector` and `cvss_score`.
+
+Choose each of the 8 metric values based on this finding's specific attack path:
+
+| Metric | Values | Meaning |
+|---|---|---|
+| AV (Attack Vector) | N/A/L/P | Network / Adjacent / Local / Physical |
+| AC (Attack Complexity) | L/H | Low (reliable exploit) / High (special conditions needed) |
+| PR (Privileges Required) | N/L/H | None / Low (any authenticated user) / High (admin) |
+| UI (User Interaction) | N/R | None / Required (victim must take an action) |
+| S (Scope) | U/C | Unchanged (same security domain) / Changed (cross-component) |
+| C (Confidentiality) | H/L/N | High (full read) / Low (partial) / None |
+| I (Integrity) | H/L/N | High (full write) / Low (partial) / None |
+| A (Availability) | H/L/N | High (full DoS) / Low (degraded) / None |
+
+Use the reference table below to pick a starting vector, then adjust for the specific finding:
+
+| Vulnerability class | Base vector | Score |
+|---|---|---|
+| RCE — network, no auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H | 9.8 |
+| RCE — network, auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H | 8.8 |
+| SQL injection — no auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N | 9.1 |
+| SQL injection — auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N | 8.1 |
+| NoSQL injection — auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N | 8.1 |
+| XXE — network, no auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N | 7.5 |
+| SSRF — no auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N | 7.5 |
+| SSRF — auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N | 6.5 |
+| Stored XSS — auth + UI required | CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:L/I:L/A:N | 5.4 |
+| Reflected XSS — no auth + UI required | CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N | 6.1 |
+| IDOR — read, auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N | 6.5 |
+| IDOR — write/delete, auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N | 8.1 |
+| Open redirect — no auth, UI required | CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N | 6.1 |
+| Hardcoded secret — network exploitable | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N | 9.1 |
+| Hardcoded secret — source code access required | CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N | 7.7 |
+| Path traversal — read, auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N | 6.5 |
+| Path traversal — write, auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N | 8.1 |
+| Insecure deserialization — no auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H | 9.8 |
+| Weak password hash (MD5/SHA1) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N | 5.9 |
+| Supply chain (curl\|sh, no hash check) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:H | 9.0 |
+| Unpinned dependency (mutable tag/ref) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H | 8.1 |
+| Prompt injection (indirect, LLM-mediated) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N | 4.8 |
+| Information leakage — error messages | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N | 5.3 |
+| Password exposed in GET params | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N | 6.5 |
+
+Adjustment examples:
+- Exploit requires admin access → PR:L → PR:H (score drops ~0.5–2.0)
+- Special conditions needed (race, specific config) → AC:L → AC:H
+- Vulnerability only exploitable locally → AV:N → AV:L
+- Cross-component impact (XSS reaches a different security domain) → S:U → S:C
+
+`cvss_score` must be consistent with `severity`: Critical 9.0–10.0, High 7.0–8.9, Medium 4.0–6.9, Low 0.1–3.9. If your vector places a finding outside the severity band, prefer the vector and note the discrepancy in `confidence_note`.
+
 ---
 
 ## Step 6 — Write findings.json
@@ -240,6 +292,8 @@ Write to `findings.json` in the current working directory. Overwrite if exists.
       "severity": "medium",
       "confidence": 0.75,
       "confidence_note": "",
+      "cvss_vector": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N",
+      "cvss_score": 4.8,
       "file": "frontend/src/components/chat/ChatComponent.tsx",
       "line": 6,
       "method": "mermaid.initialize",

@@ -14,7 +14,7 @@ Run the full pipeline in one command:
 /sast-full-scan /path/to/target-repo
 ```
 
-Skills run sequentially. Each writes a file consumed by the next:
+Independent steps run concurrently; dependent steps run sequentially. Each step writes a file consumed by the next:
 
 ```
 Target Repo
@@ -26,26 +26,32 @@ Target Repo
 │  → language-manifest.json  (which crawl/find-vulns to run)     │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
-                            ▼
+          ┌─────────────────▼──────────────────────────────────────┐
+          │  GROUP 1 — concurrent (no cross-dependencies)           │
+          │                                                         │
+          │  /crawl-python  /crawl-typescript  /crawl-java          │
+          │  Maps files by role, HTTP routes, security priority     │
+          │  → crawl-output-<lang>.json  (merged after group)       │
+          │                                                         │
+          │  /config-audit                                          │
+          │  Secrets, flags, supply chain in .env/.cfg/Dockerfile   │
+          │  → findings.json  (appended)                            │
+          └────────────────────────────┬────────────────────────────┘
+                   merge crawl outputs │
+                                       ▼
+          ┌────────────────────────────────────────────────────────┐
+          │  GROUP 2 — concurrent (both read merged crawl output)  │
+          │                                                        │
+          │  /find-vulns-python  /find-vulns-typescript            │
+          │  /find-vulns-java                                      │
+          │  Semantic source → sink analysis + CVSS 3.1 scoring    │
+          │  → findings-<lang>.json  (merged after group)          │
+          └────────────────────────┬───────────────────────────────┘
+                merge all findings │
+                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  /crawl-java  /crawl-python  /crawl-typescript                  │
-│  Maps files by role, HTTP routes, security priority score       │
-│  → crawl-output.json                                            │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  /config-audit                                                  │
-│  Secrets, flags, supply chain in .env / .cfg / Dockerfiles / CI│
-│  → findings.json  (appended)                                    │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  /find-vulns-java  /find-vulns-python  /find-vulns-typescript   │
-│  Semantic source → sink analysis — reads code, not a checklist  │
-│  → findings.json  (appended)                                    │
-└───────────────────────────┬─────────────────────────────────────┘
+│  GROUP 3 — sequential                                           │
+└─────────────────────────────────────────────────────────────────┘
                             │
               ┌─────────────┴──────────────────┐
               │  polyglot repos only            │
@@ -67,15 +73,16 @@ Target Repo
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  /validate-findings                                             │
-│  FP scoring (fp_score 0–1), deduplication, ranking             │
-│  → findings.json  (enriched: validation_status)                 │
+│  FP scoring (fp_score 0–1), deduplication                       │
+│  Rank by: severity → cvss_score DESC → fp_score ASC            │
+│  → findings.json  (enriched: validation_status, fp_score)       │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  /scan-report                                                   │
-│  → scan-results.sarif   (SARIF 2.1.0 — IDE / GitHub Security)  │
-│  → scan-summary.md      (human-readable, precision/recall)      │
+│  → scan-results.sarif   (SARIF 2.1.0 + CVSS per finding)       │
+│  → scan-summary.md      (human-readable, CVSS range, P/R)       │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
               ┌─────────────┴─────────────────┐
@@ -83,7 +90,8 @@ Target Repo
 ┌───────────────────────┐       ┌────────────────────────────┐
 │  /scan-metrics        │       │  /generate-fix FINDING-001 │
 │  → sast-metrics.json  │       │  → unified diff + tests    │
-│  (append-only history)│       │  (on demand, per finding)  │
+│  + step_timings from  │       │  (on demand, per finding)  │
+│    run-log.json        │       │                            │
 └───────────────────────┘       └────────────────────────────┘
 ```
 
@@ -137,7 +145,7 @@ cd sast-skills
 | Skill | Purpose |
 |---|---|
 | `detect-language` | Counts source files by extension, detects framework, writes routing manifest that tells `sast-full-scan` which crawl and find-vulns skills to run |
-| `sast-full-scan` | Chains all pipeline steps in order. Writes intermediate snapshots to `sast-runs/<timestamp>/`. Options: `--ground-truth`, `--skip-taint`, `--skip-config-audit`, `--out-dir`, `--dast` |
+| `sast-full-scan` | Orchestrates the pipeline in three execution groups: **Group 1** (crawl + config-audit, concurrent) → **Group 2** (find-vulns, concurrent) → **Group 3** (cross-lang-taint → taint-trace → validate → report, sequential). Writes intermediate snapshots to `sast-runs/<timestamp>/` including a structured `run-log.json` per step. Options: `--ground-truth`, `--skip-taint`, `--skip-config-audit`, `--out-dir`, `--dast` |
 
 ### Crawl — Attack Surface Mapping
 
@@ -151,10 +159,10 @@ cd sast-skills
 
 | Skill | Language | Vulnerability classes |
 |---|---|---|
-| `find-vulns` / `find-vulns-java` | Java | SQL/JPQL injection, command injection, XSS, IDOR (missing ownership check), open redirect, weak crypto, insecure deserialization, outbound leakage, resource exhaustion/ReDoS, dead defensive code |
-| `find-vulns-python` | Python | Command injection, code injection, sandbox escape, SSRF, path traversal (Zip Slip, symlink, glob, output_dir), IDOR, YAML/CSV/Cypher/LogQL injection, insecure deserialization, auth bypass, async queue taint, outbound leakage, dead defensive code, resource exhaustion/ReDoS, application-code supply chain (download+execute without hash), falsy size guard bypass, env-gated conditional findings |
-| `find-vulns-typescript` | TypeScript / JS | DOM XSS, React XSS, mapping library popup injection, CSS-as-HTML injection, open redirect, SSRF, session cookie exfiltration, IDOR (Node/Express ownership checks), prototype pollution, hardcoded secrets, outbound leakage, dead defensive code, resource exhaustion/ReDoS |
-| `config-audit` | Any | Dangerous feature flags, weak/default secrets in `.env`/`.cfg`/`.ini`/`.conf`/`constants.py`, OIDC nonce disabled, CORS wildcard+credentials, mock auth bypass, Dockerfile supply chain (curl\|bash, unpinned git clone, binary wheels, FROM without digest), CI pipeline injection, backend ports exposed past reverse proxy |
+| `find-vulns` / `find-vulns-java` | Java | SQL/JPQL injection, command injection, XSS, IDOR (missing ownership check), open redirect, weak crypto, insecure deserialization, outbound leakage, resource exhaustion/ReDoS, dead defensive code. Each finding includes `cvss_vector` + `cvss_score`. |
+| `find-vulns-python` | Python | Command injection, code injection, sandbox escape, SSRF, path traversal (Zip Slip, symlink, glob, output_dir), IDOR, YAML/CSV/Cypher/LogQL injection, insecure deserialization, auth bypass, async queue taint, outbound leakage, dead defensive code, resource exhaustion/ReDoS, application-code supply chain (download+execute without hash), falsy size guard bypass, env-gated conditional findings. Each finding includes `cvss_vector` + `cvss_score`. |
+| `find-vulns-typescript` | TypeScript / JS | DOM XSS, React XSS, mapping library popup injection, CSS-as-HTML injection, open redirect, SSRF, session cookie exfiltration, IDOR (Node/Express ownership checks), prototype pollution, hardcoded secrets, outbound leakage, dead defensive code, resource exhaustion/ReDoS. Each finding includes `cvss_vector` + `cvss_score`. |
+| `config-audit` | Any | Dangerous feature flags, weak/default secrets in `.env`/`.cfg`/`.ini`/`.conf`/`constants.py`, OIDC nonce disabled, CORS wildcard+credentials, mock auth bypass, Dockerfile supply chain (curl\|bash, unpinned git clone, binary wheels, FROM without digest), CI pipeline injection, backend ports exposed past reverse proxy. Each finding includes `cvss_vector` + `cvss_score`. |
 | `cross-language-taint` | Python + TypeScript | Stored-XSS paths where Python backend writes user data and TypeScript frontend renders as raw HTML; multi-hop prompt injection via RAG retrieval pipeline |
 
 ### Taint Tracing & Validation
@@ -162,15 +170,15 @@ cd sast-skills
 | Skill | What it adds |
 |---|---|
 | `taint-trace` | Hop-by-hop taint path from entry point to sink across file boundaries. Handles async queue hops and feature-flag conditional guards. Sets `taint_confirmed`, `taint_path[]`, `conditional_protection`. |
-| `validate-findings` | FP scoring rubric (`fp_score` 0.0–1.0) and `validation_status`: `confirmed` / `likely_real` / `needs_review` / `likely_fp`. Deduplicates and ranks. |
+| `validate-findings` | FP scoring rubric (`fp_score` 0.0–1.0) and `validation_status`: `confirmed` / `likely_real` / `needs_review` / `likely_fp`. Deduplicates. Ranks by severity → `cvss_score` DESC → `fp_score` ASC. |
 
 ### Reporting & Fixes
 
 | Skill | Output |
 |---|---|
-| `scan-report` | `scan-results.sarif` (SARIF 2.1.0) + `scan-summary.md`. Computes precision/recall when `--ground-truth` is provided. |
+| `scan-report` | `scan-results.sarif` (SARIF 2.1.0, includes `cvss_vector` + `cvss_score` per result) + `scan-summary.md` (CVSS range in summary, per-finding CVSS row). Computes precision/recall when `--ground-truth` is provided. |
 | `generate-fix` | Unified diff + explanation + test cases for one finding |
-| `scan-metrics` | Appends run metrics to `sast-metrics.json` for trend tracking |
+| `scan-metrics` | Appends run metrics to `sast-metrics.json`. Reads `run-log.json` to extract `step_timings[]` — per-step duration, findings delta, and error capture for trend analysis and scan debugging. |
 
 ### Focused Hunt Skills — Standalone
 
@@ -185,6 +193,16 @@ Run these directly on a repo without going through the full pipeline.
 | `sandbox-escape` | Restricted execution context bypasses — weakened guards in `exec()` environments |
 | `frontend-hunt` | TypeScript/React client-side injection — `innerHTML`, `dangerouslySetInnerHTML`, map popups, `postMessage` |
 | `waf-bypass` | Encoding and evasion patterns that bypass WAF rules |
+
+---
+
+## Recent Changes
+
+| Feature | What changed |
+|---|---|
+| **CVSS 3.1 numeric scoring** | All `find-vulns-*` and `config-audit` skills now output `cvss_vector` (e.g. `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`) and `cvss_score` (float). Each skill includes a reference table of pre-computed vectors for ~20 common vulnerability classes. `validate-findings` sorts within severity bands by `cvss_score` DESC. `scan-report` emits both fields in SARIF and Markdown. |
+| **Structured scan run logs** | `sast-full-scan` now writes `run-log.json` per run — one entry per pipeline step with start time, end time, findings delta, step-specific notes, and error capture. `scan-metrics` reads it to populate `step_timings[]` in `sast-metrics.json`, enabling per-step duration tracking and cross-run trend analysis. |
+| **Parallel skill execution** | `sast-full-scan` now runs in three groups: Group 1 (crawl + config-audit concurrently), Group 2 (all find-vulns concurrently after crawl merge), Group 3 (sequential). ~30–40% wall-clock reduction for polyglot repos. |
 
 ---
 

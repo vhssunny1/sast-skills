@@ -113,6 +113,8 @@ Write `scan-results.sarif` (JSON, SARIF 2.1.0 format).
   "properties": {
     "owasp": "<owasp field>",
     "severity": "<severity field>",
+    "cvss_vector": "<cvss_vector field>",
+    "cvss_score": "<cvss_score field>",
     "confidence": "<confidence_after_trace or confidence>",
     "validation_status": "<validation_status>",
     "source": "<source field>",
@@ -164,6 +166,7 @@ Write `scan-summary.md` with this structure:
 | Estimated precision | N% |
 | Recall (vs ground truth) | N% or "not computed" |
 | Files with findings | N / total |
+| CVSS score range | <min>–<max> (mean <avg>) |
 
 ---
 
@@ -177,6 +180,7 @@ For each finding with status `confirmed` or `likely_real`, render:
 |---|---|
 | File | `<file>` line <line> |
 | Method | `<method>` |
+| CVSS | `<cvss_vector>` — **<cvss_score>** |
 | Status | <validation_status> |
 | Confidence | <confidence_after_trace or confidence> |
 

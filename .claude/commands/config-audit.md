@@ -274,7 +274,9 @@ Append to `findings.json` (create if not exists). Use the same schema as find-vu
   "description": "Remote user authentication is enabled. When the backend port is directly reachable (common in Docker deployments), any attacker can authenticate as any user by forging the X-Forwarded-Remote-User header.",
   "fix_hint": "Set REDASH_REMOTE_USER_LOGIN_ENABLED=false unless SSO proxy is deployed, or add HMAC signature verification to the remote_user_auth.py login endpoint.",
   "condition": "REDASH_REMOTE_USER_LOGIN_ENABLED=true",
-  "deployment_context": "production_config"
+  "deployment_context": "production_config",
+  "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+  "cvss_score": 9.1
 }
 ```
 
@@ -295,6 +297,25 @@ Append to `findings.json` (create if not exists). Use the same schema as find-vu
 | CORS wildcard + credentials | CWE-942 | A05:2021 |
 | Mock auth bypass without production guard | CWE-290 | A07:2021 |
 | Overly permissive email domain / auth scope | CWE-284 | A01:2021 |
+
+**CVSS 3.1 scoring** — For every config finding, assign `cvss_vector` and `cvss_score`. Config findings have no attacker-controlled taint flow, so score based on what an attacker can do once they exploit the misconfiguration:
+
+| Config class | Typical vector | Score |
+|---|---|---|
+| Auth bypass feature enabled (e.g. REMOTE_USER) | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N | 9.1 |
+| Hardcoded secret — network exploitable (JWT, session key) | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N | 9.1 |
+| Hardcoded secret committed to source | CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N | 7.7 |
+| CI pipeline curl\|sh (no hash check) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:H | 9.0 |
+| Unpinned Docker/action tag (mutable) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H | 8.1 |
+| Backend port exposed, proxy bypassed | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N | 9.1 |
+| Debug mode enabled | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N | 5.3 |
+| CORS wildcard + credentials | CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:N/A:N | 6.5 |
+| CSRF disabled | CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:N | 6.5 |
+| OIDC nonce validation disabled (token replay) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N | 8.1 |
+| Safety/dev mode flag — deployment_template context | CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N | 3.3 |
+| Version number exposed | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N | 5.3 |
+
+Adjust for `deployment_context`: `development_template` or `example_file` findings where the risk is conditional should use AC:H and possibly AV:L to reflect that exploitation requires the insecure default to survive to production.
 
 ---
 

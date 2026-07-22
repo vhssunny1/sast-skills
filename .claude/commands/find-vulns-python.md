@@ -247,6 +247,57 @@ Flag as CWE-400 (uncontrolled resource consumption) at medium severity. Sanitiza
 | Symlink following | CWE-59 | A01:2021 |
 | Application-code supply chain (download without integrity check) | CWE-494 | A08:2021 |
 
+**CVSS 3.1 scoring** — For every finding, assign `cvss_vector` and `cvss_score`.
+
+Choose each of the 8 metric values based on this finding's specific attack path:
+
+| Metric | Values | Meaning |
+|---|---|---|
+| AV (Attack Vector) | N/A/L/P | Network / Adjacent / Local / Physical |
+| AC (Attack Complexity) | L/H | Low (reliable exploit) / High (special conditions needed) |
+| PR (Privileges Required) | N/L/H | None / Low (any authenticated user) / High (admin) |
+| UI (User Interaction) | N/R | None / Required (victim must take an action) |
+| S (Scope) | U/C | Unchanged (same security domain) / Changed (cross-component) |
+| C (Confidentiality) | H/L/N | High (full read) / Low (partial) / None |
+| I (Integrity) | H/L/N | High (full write) / Low (partial) / None |
+| A (Availability) | H/L/N | High (full DoS) / Low (degraded) / None |
+
+Use the reference table below to pick a starting vector, then adjust for the specific finding:
+
+| Vulnerability class | Base vector | Score |
+|---|---|---|
+| RCE — network, no auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H | 9.8 |
+| RCE — network, auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H | 8.8 |
+| SQL injection — no auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N | 9.1 |
+| SQL injection — auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N | 8.1 |
+| NoSQL / graph / observability injection — auth | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N | 8.1 |
+| SSRF — no auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N | 7.5 |
+| SSRF — auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N | 6.5 |
+| Template injection (SSTI) — no auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H | 9.8 |
+| Template injection (SSTI) — auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H | 8.8 |
+| Insecure deserialization (pickle) — no auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H | 9.8 |
+| IDOR — read, auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N | 6.5 |
+| IDOR — write/delete, auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N | 8.1 |
+| Auth bypass — header-based identity | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N | 9.1 |
+| Open redirect — no auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N | 6.1 |
+| Path traversal — read, auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N | 6.5 |
+| Path traversal — write, auth required | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N | 8.1 |
+| Hardcoded secret — network exploitable | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N | 9.1 |
+| Weak password hash (MD5/SHA1) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N | 5.9 |
+| Supply chain (download without integrity check) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:H | 9.0 |
+| CSV formula injection — auth, requires UI | CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:H/I:H/A:H | 8.0 |
+| Prompt injection (indirect, LLM-mediated) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N | 4.8 |
+| Information leakage — error messages | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N | 5.3 |
+| Resource exhaustion / ReDoS | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H | 7.5 |
+
+Adjustment examples:
+- Exploit requires admin access → PR:L → PR:H (score drops ~0.5–2.0)
+- Special conditions needed (race, specific config) → AC:L → AC:H
+- Vulnerability only exploitable locally → AV:N → AV:L
+- Auth bypass finding is conditional on a feature flag → AC:L → AC:H
+
+`cvss_score` must be consistent with `severity`: Critical 9.0–10.0, High 7.0–8.9, Medium 4.0–6.9, Low 0.1–3.9. If your vector places a finding outside the severity band, prefer the vector and note the discrepancy in `confidence_note`.
+
 ---
 
 ## Step 6 — Write findings.json
@@ -269,6 +320,8 @@ Write to `findings.json` in the current working directory. Overwrite if exists.
       "severity": "high",
       "confidence": 0.93,
       "confidence_note": "",
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+      "cvss_score": 6.5,
       "file": "backend/src/utils/git/git_util.py",
       "line": 32,
       "method": "clone_git_repo",

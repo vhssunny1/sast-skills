@@ -88,8 +88,11 @@ Based on `fp_score`:
 Sort all findings with status `confirmed`, `likely_real`, or `needs_review` by:
 
 1. Severity (critical → high → medium → low)
-2. `fp_score` ascending (most confident first within same severity)
-3. `confidence_after_trace` descending as tiebreaker
+2. `cvss_score` descending (highest numeric risk first within same severity band — this is the primary differentiator within a band, e.g. CVSS 9.8 before CVSS 9.1 both within Critical)
+3. `fp_score` ascending (most confident first at equal CVSS score)
+4. `confidence_after_trace` descending as tiebreaker
+
+If `cvss_score` is absent (e.g. finding predates CVSS scoring), fall back to sort by `fp_score` ascending then `confidence_after_trace` descending.
 
 ## Step 6 — Add precision estimate
 
