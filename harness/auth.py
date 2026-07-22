@@ -1,33 +1,32 @@
+import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 import config
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
-def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+def _hash_password(plain: str) -> bytes:
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt())
 
 
-def hash_password(plain: str) -> str:
-    return pwd_context.hash(plain)
+def _verify_password(plain: str, hashed: bytes) -> bool:
+    return bcrypt.checkpw(plain.encode(), hashed)
 
 
-# Store hashed password at startup — avoids rehashing on every request
-_HASHED_PASSWORD = hash_password(config.HARNESS_PASSWORD)
+# Hash once at startup
+_HASHED_PASSWORD: bytes = _hash_password(config.HARNESS_PASSWORD)
 
 
 def authenticate(username: str, password: str) -> bool:
     return (
         username == config.HARNESS_USERNAME
-        and verify_password(password, _HASHED_PASSWORD)
+        and _verify_password(password, _HASHED_PASSWORD)
     )
 
 

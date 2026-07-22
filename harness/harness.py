@@ -103,9 +103,17 @@ async def start_scan(req: ScanRequest):
     return {"run_id": run_id}
 
 
-@app.get("/api/scans/{run_id}/stream", dependencies=[Depends(auth.get_current_user)])
-async def stream_scan(run_id: str):
-    """SSE endpoint — streams pipeline events for a running scan."""
+@app.get("/api/scans/{run_id}/stream")
+async def stream_scan(run_id: str, token: str = ""):
+    """SSE endpoint — streams pipeline events. Token via query param (EventSource can't set headers)."""
+    # validate token manually — OAuth2PasswordBearer can't read query params
+    try:
+        auth.get_current_user(token)
+    except Exception:
+        async def denied():
+            yield {"data": json.dumps({"type": "error", "error": "unauthorized"})}
+        return EventSourceResponse(denied())
+
     queue = _active_queues.get(run_id)
 
     async def generator():
