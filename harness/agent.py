@@ -1,13 +1,13 @@
-"""Agentic loop: loads one SAST skill prompt and runs it to completion via the Anthropic API."""
+"""Agentic loop: loads one SAST skill prompt and runs it via `claude --print` CLI."""
 
 import asyncio
 from pathlib import Path
 from typing import Callable, Awaitable
 
-import anthropic
-
 import config
-from tools import TOOL_SCHEMAS, make_executor
+
+# Timeout per skill in seconds — large repos may need longer
+SKILL_TIMEOUT = int(config.MAX_SKILL_ITERATIONS) * 30  # ~30 min max
 
 
 async def run_skill(
@@ -18,7 +18,8 @@ async def run_skill(
     emit: Callable[[dict], Awaitable[None]] = None,
 ) -> str:
     """
-    Load skill_name.md, run the agentic loop, return the final text output.
+    Load skill_name.md, run it through `claude --print`, return the final text output.
+    CWD is set to workdir so the skill's file writes land in the right place.
     emit() is called with progress events for SSE streaming.
     """
     skill_file = config.SKILLS_DIR / f"{skill_name}.md"
@@ -26,7 +27,6 @@ async def run_skill(
         raise FileNotFoundError(f"Skill not found: {skill_file}")
 
     skill_prompt = skill_file.read_text(encoding="utf-8")
-    execute_tool = make_executor(workdir, repo_path)
 
     context = (
         f"Repository path: {repo_path}\n"
@@ -34,55 +34,44 @@ async def run_skill(
         f"{extra_context}"
     )
 
-    messages = [{"role": "user", "content": f"{skill_prompt}\n\n---\n{context}"}]
+    full_prompt = f"{skill_prompt}\n\n---\n{context}"
 
     if emit:
         await emit({"type": "skill_start", "skill": skill_name})
 
-    client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
-    iterations = 0
+    # Write prompt to a temp file to avoid shell quoting issues with long prompts
+    prompt_file = workdir / f".prompt-{skill_name}.txt"
+    prompt_file.write_text(full_prompt, encoding="utf-8")
 
-    while iterations < config.MAX_SKILL_ITERATIONS:
-        iterations += 1
-        response = await client.messages.create(
-            model=config.MODEL,
-            max_tokens=8096,
-            tools=TOOL_SCHEMAS,
-            messages=messages,
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "--print", f"@{prompt_file}",
+            cwd=str(workdir),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
 
-        if response.stop_reason == "end_turn":
-            final_text = next(
-                (b.text for b in response.content if hasattr(b, "text")), ""
-            )
-            if emit:
-                await emit({
-                    "type": "skill_complete",
-                    "skill": skill_name,
-                    "summary": final_text[:300],
-                })
-            return final_text
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=SKILL_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError(f"Skill '{skill_name}' timed out after {SKILL_TIMEOUT}s")
 
-        # execute tool calls
-        messages.append({"role": "assistant", "content": response.content})
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                if emit:
-                    await emit({
-                        "type": "tool_call",
-                        "skill": skill_name,
-                        "tool": block.name,
-                        "detail": str(block.input)[:120],
-                    })
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, execute_tool, block.name, block.input
-                )
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(result),
-                })
-        messages.append({"role": "user", "content": tool_results})
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace")[:600]
+            raise RuntimeError(f"claude exited {proc.returncode}: {err}")
 
-    raise RuntimeError(f"Skill '{skill_name}' hit max iterations ({config.MAX_SKILL_ITERATIONS})")
+        output = stdout.decode(errors="replace")
+
+    finally:
+        prompt_file.unlink(missing_ok=True)
+
+    if emit:
+        await emit({
+            "type": "skill_complete",
+            "skill": skill_name,
+            "summary": output[:300],
+        })
+
+    return output
