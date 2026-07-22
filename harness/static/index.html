@@ -1,0 +1,437 @@
+<title>SAST Harness</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:       #0F1117;
+    --surface:  #1A1D27;
+    --border:   #2A2D3A;
+    --text:     #E2E6F0;
+    --muted:    #6B7280;
+    --accent:   #3B82F6;
+    --success:  #22C55E;
+    --warning:  #F59E0B;
+    --danger:   #EF4444;
+    --crit:     #DC2626;
+    --high:     #EA580C;
+    --med:      #CA8A04;
+    --low:      #16A34A;
+  }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg);
+         color: var(--text); min-height: 100vh; display: flex; flex-direction: column; }
+  a { color: var(--accent); text-decoration: none; }
+
+  /* ── Login ── */
+  #login-screen { display: flex; align-items: center; justify-content: center;
+                  min-height: 100vh; }
+  .login-card { background: var(--surface); border: 1px solid var(--border);
+                border-radius: 12px; padding: 2.5rem 2rem; width: 360px; }
+  .login-card h1 { font-size: 1.4rem; margin-bottom: 0.4rem; }
+  .login-card p { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.8rem; }
+  label { display: block; font-size: 0.8rem; color: var(--muted);
+          text-transform: uppercase; letter-spacing: .04em; margin-bottom: .4rem; }
+  input[type=text], input[type=password], input[type=url] {
+    width: 100%; padding: .6rem .8rem; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: .95rem; margin-bottom: 1rem;
+    outline: none; transition: border-color .2s; }
+  input:focus { border-color: var(--accent); }
+  .btn { display: inline-flex; align-items: center; gap: .4rem; padding: .6rem 1.2rem;
+         border-radius: 6px; border: none; font-size: .9rem; cursor: pointer;
+         transition: opacity .15s; font-weight: 500; }
+  .btn:hover { opacity: .88; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .btn-danger  { background: var(--danger); color: #fff; }
+  .btn-full { width: 100%; justify-content: center; }
+  .err-msg { color: var(--danger); font-size: .85rem; margin-top: .5rem; }
+
+  /* ── App layout ── */
+  #app { display: none; flex-direction: row; min-height: 100vh; }
+  aside { width: 280px; background: var(--surface); border-right: 1px solid var(--border);
+          display: flex; flex-direction: column; flex-shrink: 0; }
+  aside header { padding: 1.2rem 1rem; border-bottom: 1px solid var(--border); }
+  aside header h2 { font-size: 1rem; font-weight: 600; }
+  aside header p  { font-size: .75rem; color: var(--muted); margin-top: .2rem; }
+  #history-list { flex: 1; overflow-y: auto; padding: .5rem 0; }
+  .history-item { padding: .6rem 1rem; cursor: pointer; border-left: 3px solid transparent;
+                  transition: background .15s; }
+  .history-item:hover { background: rgba(255,255,255,.04); }
+  .history-item.active { border-left-color: var(--accent); background: rgba(59,130,246,.08); }
+  .history-item .hi-id   { font-size: .75rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .history-item .hi-repo { font-size: .82rem; white-space: nowrap; overflow: hidden;
+                           text-overflow: ellipsis; margin-top: .1rem; }
+  .hi-status { display: inline-block; font-size: .68rem; padding: .1rem .4rem;
+               border-radius: 4px; font-weight: 600; text-transform: uppercase; margin-top: .2rem; }
+  .hs-success { background: rgba(34,197,94,.15); color: var(--success); }
+  .hs-failed  { background: rgba(239,68,68,.15);  color: var(--danger); }
+  .hs-running { background: rgba(59,130,246,.15); color: var(--accent); }
+  .hs-unknown { background: rgba(107,114,128,.15); color: var(--muted); }
+  aside footer { padding: .8rem 1rem; border-top: 1px solid var(--border);
+                 display: flex; justify-content: space-between; align-items: center; }
+  aside footer span { font-size: .78rem; color: var(--muted); }
+
+  main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* ── New scan panel ── */
+  .scan-form { padding: 1.5rem; border-bottom: 1px solid var(--border); }
+  .scan-form h3 { font-size: 1rem; margin-bottom: 1rem; }
+  .form-row { display: flex; gap: .8rem; align-items: flex-end; }
+  .form-row .url-wrap { flex: 1; }
+  .form-row input { margin-bottom: 0; }
+  .options-row { display: flex; gap: 1.2rem; margin: .8rem 0; flex-wrap: wrap; }
+  .option-check { display: flex; align-items: center; gap: .4rem; font-size: .82rem;
+                  color: var(--muted); cursor: pointer; }
+  .option-check input { width: auto; margin: 0; cursor: pointer; }
+
+  /* ── Progress ── */
+  #progress-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .panel-header { padding: .8rem 1.5rem; border-bottom: 1px solid var(--border);
+                  display: flex; align-items: center; justify-content: space-between; }
+  .panel-header h3 { font-size: .95rem; }
+  #step-list { flex: 1; overflow-y: auto; padding: 1rem 1.5rem; }
+  .step-row { display: flex; align-items: flex-start; gap: .8rem;
+              padding: .5rem 0; border-bottom: 1px solid var(--border); }
+  .step-row:last-child { border-bottom: none; }
+  .step-icon { width: 22px; height: 22px; border-radius: 50%; display: flex;
+               align-items: center; justify-content: center; font-size: .7rem;
+               flex-shrink: 0; margin-top: .1rem; }
+  .si-waiting  { background: var(--border); color: var(--muted); }
+  .si-running  { background: rgba(59,130,246,.2); color: var(--accent);
+                 animation: pulse 1.2s ease-in-out infinite; }
+  .si-done     { background: rgba(34,197,94,.15); color: var(--success); }
+  .si-skipped  { background: rgba(107,114,128,.12); color: var(--muted); }
+  .si-error    { background: rgba(239,68,68,.15); color: var(--danger); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+  .step-info { flex: 1; }
+  .step-name { font-size: .85rem; font-weight: 500; }
+  .step-detail { font-size: .75rem; color: var(--muted); margin-top: .15rem;
+                 font-family: 'Consolas', monospace; }
+
+  /* ── Results ── */
+  #results-panel { padding: 1rem 1.5rem; border-top: 1px solid var(--border); background: var(--surface); }
+  #results-panel h4 { font-size: .85rem; color: var(--muted); text-transform: uppercase;
+                      letter-spacing: .04em; margin-bottom: .8rem; }
+  .result-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px,1fr)); gap: .6rem; }
+  .result-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+                 padding: .7rem .9rem; display: flex; align-items: center; gap: .6rem; }
+  .result-card a { font-size: .82rem; color: var(--text); flex: 1; }
+  .result-card a:hover { color: var(--accent); }
+  .severity-bar { display: flex; gap: .5rem; margin-top: .8rem; flex-wrap: wrap; }
+  .sev-chip { font-size: .75rem; padding: .2rem .6rem; border-radius: 4px; font-weight: 600; }
+  .sev-c { background: rgba(220,38,38,.15); color: var(--crit); }
+  .sev-h { background: rgba(234,88,12,.15);  color: var(--high); }
+  .sev-m { background: rgba(202,138,4,.15);  color: var(--med); }
+  .sev-l { background: rgba(22,163,74,.15);  color: var(--low); }
+
+  /* ── Group labels ── */
+  .group-label { font-size: .7rem; text-transform: uppercase; letter-spacing: .06em;
+                 color: var(--accent); font-weight: 700; padding: .5rem 0 .2rem;
+                 border-bottom: 1px solid rgba(59,130,246,.2); margin-bottom: .2rem; }
+</style>
+
+<!-- ── Login ── -->
+<div id="login-screen">
+  <div class="login-card">
+    <h1>SAST Harness</h1>
+    <p>LLM-powered static analysis pipeline</p>
+    <label>Username</label>
+    <input id="l-user" type="text" autocomplete="username" placeholder="admin">
+    <label>Password</label>
+    <input id="l-pass" type="password" autocomplete="current-password">
+    <button class="btn btn-primary btn-full" onclick="doLogin()">Sign in</button>
+    <div id="l-err" class="err-msg"></div>
+  </div>
+</div>
+
+<!-- ── App ── -->
+<div id="app">
+  <aside>
+    <header>
+      <h2>SAST Harness</h2>
+      <p>Scan history</p>
+    </header>
+    <div id="history-list"></div>
+    <footer>
+      <span id="user-label"></span>
+      <button class="btn btn-outline" style="font-size:.78rem;padding:.3rem .7rem" onclick="logout()">Sign out</button>
+    </footer>
+  </aside>
+
+  <main>
+    <div class="scan-form">
+      <h3>New scan</h3>
+      <div class="form-row">
+        <div class="url-wrap">
+          <label>Git repository URL</label>
+          <input id="git-url" type="url" placeholder="https://github.com/org/repo.git">
+        </div>
+        <button class="btn btn-primary" onclick="startScan()" id="scan-btn">Scan</button>
+      </div>
+      <div class="options-row">
+        <label class="option-check"><input type="checkbox" id="opt-skip-taint"> Skip taint-trace</label>
+        <label class="option-check"><input type="checkbox" id="opt-skip-config"> Skip config-audit</label>
+        <label class="option-check"><input type="checkbox" id="opt-dast"> Generate DAST tests</label>
+        <label class="option-check"><input type="checkbox" id="opt-fresh"> Force fresh (ignore resume)</label>
+      </div>
+    </div>
+
+    <div id="progress-panel">
+      <div class="panel-header">
+        <h3 id="panel-title">Ready</h3>
+        <button class="btn btn-danger" id="cancel-btn" style="display:none;font-size:.8rem;padding:.35rem .8rem"
+                onclick="cancelScan()">Cancel</button>
+      </div>
+      <div id="step-list"></div>
+      <div id="results-panel" style="display:none"></div>
+    </div>
+  </main>
+</div>
+
+<script>
+let TOKEN = localStorage.getItem('sast_token') || '';
+let ACTIVE_RUN = null;
+let SSE = null;
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+async function doLogin() {
+  const user = document.getElementById('l-user').value;
+  const pass = document.getElementById('l-pass').value;
+  const body = new URLSearchParams({ username: user, password: pass });
+  const r = await fetch('/api/auth/login', { method: 'POST', body });
+  if (!r.ok) { document.getElementById('l-err').textContent = 'Invalid credentials'; return; }
+  const data = await r.json();
+  TOKEN = data.access_token;
+  localStorage.setItem('sast_token', TOKEN);
+  localStorage.setItem('sast_user', user);
+  showApp(user);
+}
+
+function logout() {
+  TOKEN = ''; localStorage.removeItem('sast_token'); localStorage.removeItem('sast_user');
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('login-screen').style.display = 'flex';
+}
+
+function hdr() { return { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json' }; }
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  if (TOKEN) { showApp(localStorage.getItem('sast_user') || 'admin'); }
+  document.getElementById('l-pass').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+});
+
+function showApp(user) {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('app').style.display = 'flex';
+  document.getElementById('user-label').textContent = user;
+  loadHistory();
+}
+
+// ── History ───────────────────────────────────────────────────────────────────
+async function loadHistory() {
+  const runs = await fetch('/api/scans', { headers: hdr() }).then(r => r.json()).catch(() => []);
+  const list = document.getElementById('history-list');
+  list.innerHTML = '';
+  runs.forEach(run => {
+    const item = document.createElement('div');
+    item.className = 'history-item';
+    item.dataset.runId = run.run_id;
+    const statusCls = { success:'hs-success', failed:'hs-failed',
+                        in_progress:'hs-running' }[run.status] || 'hs-unknown';
+    const label = run.active ? 'running' : run.status;
+    const repo = run.git_url ? run.git_url.split('/').slice(-1)[0].replace('.git','') : run.run_id;
+    item.innerHTML = `
+      <div class="hi-id">${run.run_id}</div>
+      <div class="hi-repo">${repo}</div>
+      <span class="hi-status ${statusCls}">${label}</span>`;
+    item.addEventListener('click', () => viewRun(run.run_id));
+    list.appendChild(item);
+  });
+}
+
+// ── Start scan ────────────────────────────────────────────────────────────────
+async function startScan() {
+  const url = document.getElementById('git-url').value.trim();
+  if (!url) { alert('Enter a Git URL'); return; }
+
+  const body = {
+    git_url:          url,
+    skip_taint:       document.getElementById('opt-skip-taint').checked,
+    skip_config_audit:document.getElementById('opt-skip-config').checked,
+    dast:             document.getElementById('opt-dast').checked,
+    fresh:            document.getElementById('opt-fresh').checked,
+  };
+
+  document.getElementById('scan-btn').disabled = true;
+  clearProgress();
+  setPanelTitle('Cloning repo & starting scan…');
+
+  const r = await fetch('/api/scans', { method:'POST', headers: hdr(), body: JSON.stringify(body) });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: 'Unknown error' }));
+    setPanelTitle('Error: ' + (err.detail || 'Failed to start'));
+    document.getElementById('scan-btn').disabled = false;
+    return;
+  }
+  const { run_id } = await r.json();
+  ACTIVE_RUN = run_id;
+  document.getElementById('cancel-btn').style.display = '';
+  openSSE(run_id);
+  setTimeout(loadHistory, 800);
+}
+
+// ── SSE stream ────────────────────────────────────────────────────────────────
+const PIPELINE_STEPS = [
+  { group: 'Group 1 — concurrent', steps: ['detect-language'] },
+  { group: null, steps: ['crawl-python','crawl-typescript','crawl-java','config-audit'] },
+  { group: 'Group 2 — concurrent', steps: ['find-vulns-python','find-vulns-typescript','find-vulns-java'] },
+  { group: 'Group 3 — sequential', steps: ['cross-language-taint','taint-trace','validate-findings','scan-report','generate-dast-tests'] },
+];
+
+let stepEls = {};
+
+function clearProgress() {
+  document.getElementById('step-list').innerHTML = '';
+  document.getElementById('results-panel').style.display = 'none';
+  stepEls = {};
+}
+
+function setPanelTitle(t) { document.getElementById('panel-title').textContent = t; }
+
+function ensureStepRow(stepName) {
+  if (stepEls[stepName]) return;
+  const row = document.createElement('div');
+  row.className = 'step-row';
+  row.id = 'sr-' + stepName;
+  row.innerHTML = `
+    <div class="step-icon si-waiting" id="si-${stepName}">·</div>
+    <div class="step-info">
+      <div class="step-name">${stepName}</div>
+      <div class="step-detail" id="sd-${stepName}"></div>
+    </div>`;
+  document.getElementById('step-list').appendChild(row);
+  stepEls[stepName] = row;
+}
+
+function setStepState(stepName, state, detail='') {
+  ensureStepRow(stepName);
+  const icon = document.getElementById('si-' + stepName);
+  const det  = document.getElementById('sd-' + stepName);
+  const map = {
+    running: ['si-running', '⟳'],
+    done:    ['si-done',    '✓'],
+    skipped: ['si-skipped', '—'],
+    error:   ['si-error',   '✗'],
+  };
+  if (map[state]) {
+    icon.className = 'step-icon ' + map[state][0];
+    icon.textContent = map[state][1];
+  }
+  if (detail) det.textContent = detail;
+}
+
+function openSSE(run_id) {
+  if (SSE) SSE.close();
+  SSE = new EventSource(`/api/scans/${run_id}/stream?token=${TOKEN}`);
+  SSE.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    handleEvent(ev);
+  };
+  SSE.onerror = () => {
+    setPanelTitle('Connection lost — scan may still be running');
+    document.getElementById('scan-btn').disabled = false;
+  };
+}
+
+function handleEvent(ev) {
+  switch (ev.type) {
+    case 'resume':
+      setPanelTitle(`Resuming from ${ev.failed_at} (run ${ev.run_id})`);
+      break;
+    case 'pipeline_start':
+      setPanelTitle(ev.resuming ? `Resuming — ${ev.run_id}` : `Scanning — ${ev.run_id}`);
+      break;
+    case 'group_start':
+      if (ev.skills) ev.skills.forEach(s => ensureStepRow(s));
+      break;
+    case 'skill_start':
+    case 'step_start':
+      setStepState(ev.step || ev.skill, 'running');
+      break;
+    case 'tool_call':
+      setStepState(ev.skill, 'running', `${ev.tool}: ${ev.detail || ''}`);
+      break;
+    case 'skill_complete':
+    case 'step_complete':
+      setStepState(ev.step || ev.skill, 'done',
+        ev.findings_after != null ? `${ev.findings_after} findings` : (ev.summary || ''));
+      break;
+    case 'step_skipped':
+      setStepState(ev.step, 'skipped', ev.reason || '');
+      break;
+    case 'step_error':
+    case 'fatal_error':
+      setStepState(ev.step || 'pipeline', 'error', ev.error || '');
+      setPanelTitle('Scan failed');
+      finish();
+      break;
+    case 'pipeline_complete':
+      setPanelTitle(`Scan complete — ${ev.total_findings} findings`);
+      showResults(ev.run_id);
+      finish();
+      break;
+  }
+}
+
+function finish() {
+  document.getElementById('scan-btn').disabled = false;
+  document.getElementById('cancel-btn').style.display = 'none';
+  if (SSE) { SSE.close(); SSE = null; }
+  ACTIVE_RUN = null;
+  setTimeout(loadHistory, 500);
+}
+
+function showResults(run_id) {
+  const panel = document.getElementById('results-panel');
+  const files = [
+    { name: 'scan-summary.md',       label: 'Markdown report',    icon: '📄' },
+    { name: 'scan-results.sarif',    label: 'SARIF 2.1.0',         icon: '🔍' },
+    { name: 'findings-final.json',   label: 'findings.json',       icon: '{}' },
+    { name: 'findings-validated.json',label: 'Validated findings', icon: '{}' },
+    { name: 'run-log.json',          label: 'Run log',             icon: '📋' },
+    { name: 'dast-tests.py',         label: 'DAST test script',    icon: '🧪' },
+  ];
+  panel.style.display = '';
+  panel.innerHTML = `<h4>Downloads — ${run_id}</h4><div class="result-grid">` +
+    files.map(f => `
+      <div class="result-card">
+        <span>${f.icon}</span>
+        <a href="/api/scans/${run_id}/files/${f.name}" target="_blank">${f.label}</a>
+      </div>`).join('') +
+    '</div>';
+}
+
+async function viewRun(run_id) {
+  document.querySelectorAll('.history-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.runId === run_id);
+  });
+  clearProgress();
+  const log = await fetch(`/api/scans/${run_id}`, { headers: hdr() }).then(r => r.json());
+  const label = { success:'Complete', failed:'Failed', in_progress:'In progress' }[log.status] || log.status;
+  setPanelTitle(`${run_id} — ${label}`);
+  log.steps?.forEach(s => {
+    ensureStepRow(s.step);
+    const state = { completed:'done', skipped:'skipped', failed:'error', started:'running' }[s.status] || 'waiting';
+    const detail = s.findings_after != null ? `${s.findings_after} findings` :
+                   s.skip_reason ? s.skip_reason : s.error || '';
+    setStepState(s.step, state, detail);
+  });
+  if (log.status === 'success') showResults(run_id);
+}
+
+async function cancelScan() {
+  if (!ACTIVE_RUN) return;
+  await fetch(`/api/scans/${ACTIVE_RUN}`, { method:'DELETE', headers: hdr() });
+  finish();
+}
+</script>
