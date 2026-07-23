@@ -9,6 +9,7 @@ Includes auto-resume: detects the most recent incomplete run for the same repo.
 
 import asyncio
 import json
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,19 @@ from typing import Callable, Awaitable, Optional
 
 import config
 from agent import run_skill
+
+# Ensure Joern and Java are findable regardless of how the harness was launched.
+# These are the known install locations on this machine.
+_EXTRA_PATH_DIRS = [
+    r"C:\Users\Harikrishna_Valugond\Downloads\joern-cli\joern-cli",
+    r"C:\Program Files\Microsoft\jdk-21.0.11.10-hotspot\bin",
+    r"C:\Program Files\LLVM\bin",
+]
+_current_path = os.environ.get("PATH", "")
+for _d in _EXTRA_PATH_DIRS:
+    if _d not in _current_path:
+        os.environ["PATH"] = _current_path + os.pathsep + _d
+        _current_path = os.environ["PATH"]
 
 # Maps failed_at_step → the last good findings snapshot to restore
 RESUME_ARTIFACT_MAP = {
@@ -25,8 +39,11 @@ RESUME_ARTIFACT_MAP = {
     "taint-trace":           "findings-cross-lang.json",   # fallback: findings-raw.json
     "cross-language-taint":  "findings-raw.json",
     "find-vulns":            "findings-after-config-audit.json",
+    "codeql-scan":           "findings-after-config-audit.json",
     "config-audit":          None,
     "crawl":                 None,
+    "joern-parse":           None,
+    "tree-sitter-crawl":     None,
     "detect-language":       None,
 }
 
@@ -81,7 +98,7 @@ def restore_artifacts(run_dir: Path, failed_at_step: str, workdir: Path):
         if src and src.exists():
             shutil.copy(src, workdir / "findings.json")
 
-    for fname in ("crawl-output.json", "language-manifest.json"):
+    for fname in ("crawl-output.json", "language-manifest.json", "cpg-output.json"):
         src = run_dir / fname
         if src.exists():
             shutil.copy(src, workdir / fname)
@@ -116,13 +133,19 @@ def _log_start(log: dict, log_path: Path, step_name: str, findings_before: Optio
 
 
 def _log_complete(log: dict, log_path: Path, step_name: str,
-                  findings_after: Optional[int], artifacts: list, notes: dict):
+                  findings_after: Optional[int], artifacts: list, notes: dict,
+                  duration_seconds: Optional[float] = None):
     for s in log["steps"]:
         if s.get("step") == step_name and s.get("status") == "started":
+            findings_before = s.get("findings_before")
+            findings_delta = (findings_after - findings_before
+                              if findings_after is not None and findings_before is not None else None)
             s.update({
                 "status": "completed",
                 "completed_at": now_iso(),
+                "duration_seconds": duration_seconds,
                 "findings_after": findings_after,
+                "findings_delta": findings_delta,
                 "output_artifacts": artifacts,
                 "error": None,
                 "notes": notes,
@@ -141,24 +164,37 @@ def _log_skip(log: dict, log_path: Path, step_name: str, reason: str):
     _write_log(log_path, log)
 
 
-def _log_fail(log: dict, log_path: Path, step_name: str, error: str):
+def _log_fail(log: dict, log_path: Path, step_name: str, error: str,
+              duration_seconds: Optional[float] = None):
     for s in log["steps"]:
         if s.get("step") == step_name and s.get("status") == "started":
-            s.update({"status": "failed", "completed_at": now_iso(), "error": error})
+            s.update({"status": "failed", "completed_at": now_iso(), "error": error,
+                      "duration_seconds": duration_seconds})
             break
     log["status"] = "failed"
     log["failed_at_step"] = step_name
     _write_log(log_path, log)
 
 
-def _count_findings(workdir: Path) -> Optional[int]:
+async def _count_findings(workdir: Path) -> Optional[int]:
     f = workdir / "findings.json"
-    if not f.exists():
-        return None
-    try:
-        return json.loads(f.read_text()).get("total_findings", 0)
-    except Exception:
-        return None
+    # Windows can briefly hold the file handle/lock open for a moment after the
+    # `claude` subprocess exits (AV scan, delayed handle release), so retry
+    # a couple of times before giving up rather than silently reporting null.
+    for attempt in range(3):
+        if not f.exists():
+            if attempt < 2:
+                await asyncio.sleep(0.3)
+                continue
+            return None
+        try:
+            return json.loads(f.read_text()).get("total_findings", 0)
+        except Exception:
+            if attempt < 2:
+                await asyncio.sleep(0.3)
+                continue
+            return None
+    return None
 
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
@@ -171,6 +207,9 @@ async def run_pipeline(
     ground_truth: Optional[str] = None,
     skip_taint: bool = False,
     skip_config_audit: bool = False,
+    skip_tree_sitter: bool = False,
+    skip_joern: bool = False,
+    codeql: bool = False,
     dast: bool = False,
     fresh: bool = False,
     resume_run_id: Optional[str] = None,
@@ -226,23 +265,30 @@ async def run_pipeline(
             await emit({"type": "step_skipped", "step": skill_name, "reason": skip_reason})
             return True
 
-        findings_before = _count_findings(workdir)
+        findings_before = await _count_findings(workdir)
         _log_start(log, log_path, skill_name, findings_before)
         await emit({"type": "step_start", "step": skill_name})
+        t0 = asyncio.get_event_loop().time()
 
         try:
             await run_skill(skill_name, repo_path, workdir, extra_context, emit)
         except Exception as exc:
-            _log_fail(log, log_path, skill_name, str(exc))
-            await emit({"type": "step_error", "step": skill_name, "error": str(exc)})
+            duration = round(asyncio.get_event_loop().time() - t0, 1)
+            _log_fail(log, log_path, skill_name, str(exc), duration)
+            await emit({"type": "step_error", "step": skill_name, "error": str(exc),
+                        "duration_seconds": duration})
             return False
 
-        findings_after = _count_findings(workdir)
+        duration = round(asyncio.get_event_loop().time() - t0, 1)
+        findings_after = await _count_findings(workdir)
+        findings_delta = (findings_after - findings_before
+                          if findings_after is not None and findings_before is not None else None)
         arts = artifacts or []
         notes = notes_fn() if notes_fn else {}
-        _log_complete(log, log_path, skill_name, findings_after, arts, notes)
+        _log_complete(log, log_path, skill_name, findings_after, arts, notes, duration)
         await emit({"type": "step_complete", "step": skill_name,
-                    "findings_after": findings_after})
+                    "findings_after": findings_after, "findings_delta": findings_delta,
+                    "duration_seconds": duration})
         return True
 
     # ── Step 1: detect-language ────────────────────────────────────────────────
@@ -262,14 +308,68 @@ async def run_pipeline(
     polyglot        = lang_manifest.get("polyglot", False)
     shutil.copy(workdir / "language-manifest.json", run_dir / "language-manifest.json")
 
+    # ── Step 2a: tree-sitter-crawl ────────────────────────────────────────────
+    tree_sitter_ran = False
+    if skip_tree_sitter:
+        _log_skip(log, log_path, "tree-sitter-crawl", "--skip-tree-sitter")
+        await emit({"type": "step_skipped", "step": "tree-sitter-crawl",
+                    "reason": "--skip-tree-sitter"})
+    elif not shutil.which("tree-sitter"):
+        _log_skip(log, log_path, "tree-sitter-crawl", "tree-sitter CLI not installed")
+        await emit({"type": "step_skipped", "step": "tree-sitter-crawl",
+                    "reason": "tree-sitter CLI not installed"})
+    else:
+        ok = await step(
+            "crawl-tree-sitter",
+            extra_context=f"Arguments: {repo_path} --manifest language-manifest.json",
+            artifacts=["crawl-output-treesitter.json"],
+        )
+        if ok:
+            ts_out = workdir / "crawl-output.json"
+            if ts_out.exists():
+                try:
+                    data = json.loads(ts_out.read_text())
+                    if data.get("ts_available", False):
+                        tree_sitter_ran = True
+                        shutil.copy(ts_out, run_dir / "crawl-output-treesitter.json")
+                except Exception:
+                    pass  # parse error — fall through to heuristic crawl
+
+    # ── Step 2b: joern-parse ──────────────────────────────────────────────────
+    if skip_joern:
+        _log_skip(log, log_path, "joern-parse", "--skip-joern")
+        await emit({"type": "step_skipped", "step": "joern-parse", "reason": "--skip-joern"})
+    elif not shutil.which("joern"):
+        _log_skip(log, log_path, "joern-parse", "Joern not installed")
+        await emit({"type": "step_skipped", "step": "joern-parse",
+                    "reason": "Joern not installed"})
+    else:
+        # Pass the resolved absolute path explicitly — the LLM's own Bash tool
+        # sandbox does not reliably inherit our os.environ PATH injection, so
+        # PATH-based auto-detection inside the skill silently reports
+        # "not installed" even though shutil.which() finds it here.
+        joern_bin = shutil.which("joern")
+        ok = await step(
+            "joern-parse",
+            extra_context=(f"Arguments: {repo_path} --manifest language-manifest.json "
+                           f"--cpg-out cpg-output.json --joern-bin {joern_bin}"),
+            artifacts=["cpg-output.json"],
+        )
+        if ok and (workdir / "cpg-output.json").exists():
+            shutil.copy(workdir / "cpg-output.json", run_dir / "cpg-output.json")
+
     # ── Group 1: crawl + config-audit concurrently ────────────────────────────
     await emit({"type": "group_start", "group": 1,
                 "skills": crawl_skills + ([] if skip_config_audit else ["config-audit"])})
 
     group1_tasks = []
     for skill in crawl_skills:
-        group1_tasks.append(step(skill, extra_context=f"Arguments: {repo_path}",
-                                 artifacts=[f"crawl-output-{skill.replace('crawl-','')}.json"]))
+        if tree_sitter_ran:
+            group1_tasks.append(step(skill,
+                                     skip_reason="superseded by tree-sitter-crawl"))
+        else:
+            group1_tasks.append(step(skill, extra_context=f"Arguments: {repo_path}",
+                                     artifacts=[f"crawl-output-{skill.replace('crawl-','')}.json"]))
     if not skip_config_audit:
         group1_tasks.append(step("config-audit", extra_context=f"Arguments: {repo_path}",
                                  artifacts=["findings-after-config-audit.json"]))
@@ -307,48 +407,103 @@ async def run_pipeline(
 
     await emit({"type": "group_complete", "group": 1})
 
-    # ── Group 2: find-vulns concurrently ──────────────────────────────────────
-    await emit({"type": "group_start", "group": 2, "skills": findvulns_skills})
+    # ── Group 2: find-vulns (batched per language, sequential) + optional codeql ──
+    # find-vulns-* skills all hardcode "overwrite findings.json" in their own
+    # instructions (they don't accept an --output flag), so:
+    #  1. Languages must run SEQUENTIALLY, not concurrently — concurrent runs would
+    #     race on the same workdir/findings.json and silently clobber each other.
+    #  2. Each language's own file list is split into fixed-size batches so a single
+    #     agent turn is never asked to exhaustively read hundreds of files at once —
+    #     that was silently truncating coverage (e.g. 27/232 required files read).
+    #  3. CONFIG-* findings from config-audit are explicitly preserved across the
+    #     merge — the skills' "overwrite" behavior was silently deleting them.
+    cpg_arg = " --cpg cpg-output.json" if (workdir / "cpg-output.json").exists() else ""
+    g2_skill_list = findvulns_skills + (["codeql-scan"] if codeql else [])
+    await emit({"type": "group_start", "group": 2, "skills": g2_skill_list})
 
-    group2_tasks = [
-        step(skill, extra_context="Arguments: --crawl crawl-output.json",
-             artifacts=[f"findings-{skill.replace('find-vulns-','')}.json"])
-        for skill in findvulns_skills
-    ]
-    results = await asyncio.gather(*group2_tasks)
-    if not all(results):
+    try:
+        crawl_data = json.loads((workdir / "crawl-output.json").read_text())
+    except Exception:
+        crawl_data = {}
+
+    async def run_find_vulns_language(skill_name: str):
+        lang = skill_name.replace("find-vulns-", "")
+        prefix = FIND_VULNS_PREFIX.get(skill_name, lang.upper())
+        priority_files = _priority_files_for_language(crawl_data, lang, polyglot)
+        batches = _batch(priority_files, FIND_VULNS_BATCH_SIZE) or [[]]
+
+        accumulated = []
+        counter = 0
+        for i, batch_files in enumerate(batches):
+            multi = len(batches) > 1
+            step_name = skill_name if not multi else f"{skill_name}-batch{i+1}of{len(batches)}"
+            batch_note = ""
+            if multi:
+                file_list = "\n".join(f"- {p}" for p in batch_files)
+                batch_note = (
+                    f"\n\nBATCH MODE (enforced by harness for full coverage): this is batch "
+                    f"{i+1} of {len(batches)}. Restrict Step 4 file analysis EXCLUSIVELY to "
+                    f"these {len(batch_files)} pre-selected files this pass — do not read any "
+                    f"other files, and do not skip any of these:\n{file_list}"
+                )
+            ok = await step(step_name,
+                            extra_context=f"Arguments: --crawl crawl-output.json{cpg_arg}{batch_note}",
+                            artifacts=[f"findings-{lang}-batch{i+1}.json"])
+            if not ok:
+                return False, prefix, accumulated
+            out = workdir / "findings.json"
+            if out.exists():
+                try:
+                    data = json.loads(out.read_text())
+                    for f in data.get("findings", []):
+                        counter += 1
+                        f["id"] = f"{prefix}-{counter:03d}"
+                        accumulated.append(f)
+                except Exception:
+                    pass
+        return True, prefix, accumulated
+
+    codeql_task = None
+    if codeql:
+        codeql_task = asyncio.create_task(step(
+            "codeql-scan",
+            extra_context=f"Arguments: {repo_path} --manifest language-manifest.json",
+            artifacts=["codeql-output.json"],
+        ))
+
+    fv_results = []
+    for skill in findvulns_skills:
+        result = await run_find_vulns_language(skill)
+        fv_results.append(result)
+        if not result[0]:
+            if codeql_task:
+                await codeql_task
+            return
+
+    if codeql_task and not await codeql_task:
         return
 
-    # merge findings if polyglot
-    if polyglot and len(findvulns_skills) > 1:
-        prefix_map = {"find-vulns-python": "PY", "find-vulns-typescript": "TS",
-                      "find-vulns-java": "JAVA"}
-        all_findings = []
-        counters = {}
-        existing = workdir / "findings.json"
-        if existing.exists():
+    all_findings = []
+    existing = workdir / "findings.json"
+    if existing.exists():
+        try:
             base = json.loads(existing.read_text())
             all_findings.extend([f for f in base.get("findings", [])
                                   if f.get("id", "").startswith("CONFIG")])
-        for skill in findvulns_skills:
-            lang = skill.replace("find-vulns-", "")
-            src = workdir / f"findings-{lang}.json"
-            if src.exists():
-                data = json.loads(src.read_text())
-                prefix = prefix_map.get(skill, lang.upper())
-                counters[prefix] = counters.get(prefix, 0)
-                for f in data.get("findings", []):
-                    counters[prefix] += 1
-                    f["id"] = f"{prefix}-{counters[prefix]:03d}"
-                    all_findings.append(f)
+        except Exception:
+            pass
+    for _ok, _prefix, findings in fv_results:
+        all_findings.extend(findings)
 
-        merged_findings = {
-            "scanned_at": now_iso(), "repo_path": str(repo_path),
-            "language": "polyglot", "total_findings": len(all_findings),
-            "findings_by_severity": _count_by_severity(all_findings),
-            "findings": all_findings,
-        }
-        (workdir / "findings.json").write_text(json.dumps(merged_findings, indent=2))
+    merged_findings = {
+        "scanned_at": now_iso(), "repo_path": str(repo_path),
+        "language": "polyglot" if polyglot else (findvulns_skills[0].replace("find-vulns-", "")
+                                                   if findvulns_skills else "unknown"),
+        "total_findings": len(all_findings),
+        "findings_by_severity": _count_by_severity(all_findings),
+        "findings": all_findings,
+    }
+    (workdir / "findings.json").write_text(json.dumps(merged_findings, indent=2))
 
     shutil.copy(workdir / "findings.json", run_dir / "findings-raw.json")
     await emit({"type": "group_complete", "group": 2})
@@ -417,9 +572,13 @@ async def run_pipeline(
     log["completed_at"] = now_iso()
     _write_log(log_path, log)
 
-    total = _count_findings(workdir) or 0
+    total = await _count_findings(workdir) or 0
+    started = datetime.fromisoformat(log["started_at"])
+    completed = datetime.fromisoformat(log["completed_at"])
+    total_duration = round((completed - started).total_seconds(), 1)
     await emit({"type": "pipeline_complete", "run_id": run_dir.name,
-                "total_findings": total, "run_dir": str(run_dir)})
+                "total_findings": total, "run_dir": str(run_dir),
+                "total_duration_seconds": total_duration})
 
 
 def _count_by_severity(findings: list) -> dict:
@@ -429,3 +588,22 @@ def _count_by_severity(findings: list) -> dict:
         if sev in counts:
             counts[sev] += 1
     return counts
+
+
+FIND_VULNS_PREFIX = {"find-vulns-python": "PY", "find-vulns-typescript": "TS", "find-vulns-java": "JAVA"}
+FIND_VULNS_BATCH_SIZE = 40
+
+
+def _priority_files_for_language(crawl_data: dict, language: str, polyglot: bool) -> list:
+    """Files with security_priority >= 2, highest priority first — the set find-vulns-*
+    is contractually required to give a full read pass (CLAUDE.md coverage-completeness rule)."""
+    files = crawl_data.get("files", [])
+    if polyglot:
+        files = [f for f in files if f.get("language") == language]
+    prioritized = [f for f in files if f.get("security_priority", 0) >= 2]
+    prioritized.sort(key=lambda f: f.get("security_priority", 0), reverse=True)
+    return [f["path"] for f in prioritized if f.get("path")]
+
+
+def _batch(items: list, size: int) -> list:
+    return [items[i:i + size] for i in range(0, len(items), size)] if items else []

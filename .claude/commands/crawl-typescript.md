@@ -45,6 +45,22 @@ Scan the first 120 lines for markers. Apply the FIRST matching role:
 
 ---
 
+## Security priority scoring (per file)
+
+While reading the first 120 lines for role classification, also assign `security_priority` (1–5) based on dangerous patterns seen:
+
+| Score | Indicators |
+|---|---|
+| 5 | `dangerouslySetInnerHTML`, `eval(`, `new Function(`, `vm.runInContext`, `child_process.exec`/`.spawn` with shell interpolation, direct `element.innerHTML =`/`outerHTML =`/`document.write(` assignment with non-literal content |
+| 4 | Route/handler files reading `req.query`/`req.body`/`req.params`/`req.headers` directly; `fetch(`/`axios.`/`got(` called with a non-literal URL; `fs.readFile`/`fs.writeFile`/`res.sendFile` built from a path variable; `res.redirect(`/`window.location =` with a dynamic target; JWT/auth code (`jsonwebtoken`, `verify(`, `sign(`); CORS or CSP configuration code |
+| 3 | Service/API files making outbound HTTP calls; DB query builders (Prisma, Knex, raw SQL template strings); file upload handlers; session/cookie read-or-write code; `Object.assign`/deep-merge on externally sourced objects |
+| 2 | React components rendering data sourced from props/state that ultimately came from an API response or URL; controlled form inputs (`onChange`, `useState` bound to user text); standard business-logic services/components with no obvious sink |
+| 1 | Pure `interface`/`type`/`enum` definitions, constants, generated code (`*.generated.ts`), styling-only files, static content with no dynamic data |
+
+`find-vulns-typescript` reads files in descending `security_priority` order within each role tier, and every file at `security_priority` ≥ 2 must receive a full read pass — only priority-1 files may be skipped.
+
+---
+
 ## Step 3 — Extract routes from entry_point files
 
 **Next.js file-based routing:**
@@ -119,7 +135,8 @@ Write to `crawl-output.json` in the current working directory. Overwrite if exis
       "path": "frontend/src/components/chat/ChatComponent.tsx",
       "role": "component",
       "lines": 120,
-      "language": "typescript"
+      "language": "typescript",
+      "security_priority": 3
     }
   ],
   "dependencies": [
@@ -153,6 +170,7 @@ crawl-typescript complete.
   Entry points: <N> routes across <N> files
   Components  : <N> files
   Services    : <N> files
+  High-priority : <N> files with security_priority ≥ 4
   Flagged deps: <list>
   Output      : crawl-output.json
 ```

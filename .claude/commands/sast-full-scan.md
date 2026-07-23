@@ -1,4 +1,4 @@
-Orchestrate a complete SAST pipeline run against any language repository. Detects the language first, then routes to language-specific crawl and find-vulns skills, then runs config-audit, optional cross-language taint merging, and the language-neutral taint-trace → validate-findings → scan-report pipeline.
+Orchestrate a complete SAST pipeline run against any language repository. Detects the language first, optionally builds a Code Property Graph (Joern) for exhaustive taint coverage, then routes to language-specific crawl and find-vulns skills, then runs config-audit, optional cross-language taint merging, and the language-neutral taint-trace → validate-findings → scan-report pipeline.
 
 Supports Java, Python, TypeScript/JavaScript, and polyglot repos.
 
@@ -9,6 +9,11 @@ Supports Java, Python, TypeScript/JavaScript, and polyglot repos.
 ```
 DETECT-LANGUAGE  → "What language(s) is this repo? Which skills should run?"
                    Without this, crawl and find-vulns run with wrong assumptions.
+
+JOERN-PARSE      → "What are ALL taint paths in this repo, graph-exhaustively?"
+                   Builds a Code Property Graph (CPG). Runs automatically if Joern
+                   is installed; skipped silently if not. Produces cpg-output.json
+                   consumed by find-vulns skills to prevent missed taint chains.
 
 ╔══════════════════════════════════════════════════════════════╗
 ║  GROUP 1 — run all three concurrently                        ║
@@ -23,13 +28,15 @@ DETECT-LANGUAGE  → "What language(s) is this repo? Which skills should run?"
                    ↓ (merge crawl outputs when all done)
 
 ╔══════════════════════════════════════════════════════════════╗
-║  GROUP 2 — run both concurrently, after Group 1 merges       ║
+║  GROUP 2 — run concurrently, after Group 1 merges            ║
 ║                                                              ║
 ║  FIND-VULNS-A   → "Vulnerabilities in language A?"           ║
 ║  FIND-VULNS-B   → "Vulnerabilities in language B?"           ║
+║  CODEQL-SCAN    → "Second-signal confirmation?" (--codeql)   ║
 ║                                                              ║
-║  Both consume the merged crawl-output.json.                  ║
-║  Neither depends on the other's output.                      ║
+║  All consume the merged crawl-output.json + cpg-output.json. ║
+║  find-vulns skills use CPG taint hints to guide file reads.  ║
+║  codeql-scan runs independently; merges into findings after. ║
 ╚══════════════════════════════════════════════════════════════╝
                    ↓ (merge findings when all done)
 
@@ -40,9 +47,11 @@ CROSS-LANGUAGE-TAINT → "Does taint cross the Python→TypeScript boundary?" (p
 
 TAINT-TRACE      → "Does attacker-controlled data actually flow to that sink?"
                    Cross-file verification. Converts guesses into confirmed paths.
+                   Uses call_graph[] from cpg-output.json to resolve callers faster.
 
 VALIDATE         → "How confident are we in each finding? What is probably noise?"
                    Scores false-positive likelihood. Makes suppression auditable.
+                   Applies -0.25 fp_score reduction for codeql_confirmed findings.
 
 SCAN-REPORT      → "How do we communicate this to humans and tools?"
                    SARIF for tooling. Markdown for humans. Root-cause grouping.
@@ -55,13 +64,16 @@ GENERATE-DAST-TESTS (--dast only) → "How do I dynamically confirm these findin
 
 ## Input
 
-`$ARGUMENTS` format: `<repo-path> [--ground-truth <path>] [--out-dir <path>] [--skip-taint] [--skip-config-audit] [--dast] [--fresh] [--resume <run-id>]`
+`$ARGUMENTS` format: `<repo-path> [--ground-truth <path>] [--out-dir <path>] [--skip-taint] [--skip-config-audit] [--skip-tree-sitter] [--skip-joern] [--codeql] [--dast] [--fresh] [--resume <run-id>]`
 
 - `<repo-path>` — required. Path to the repository root (any language).
 - `--ground-truth <path>` — optional. Path to ground truth file for precision/recall.
 - `--out-dir <path>` — where to write all outputs (default: `./sast-runs/<timestamp>/`)
 - `--skip-taint` — skip taint-trace (faster, higher FP rate)
 - `--skip-config-audit` — skip config-audit step (use when no .env or docker-compose files present)
+- `--skip-tree-sitter` — skip tree-sitter AST crawl even if installed. Falls back to heuristic crawl-python/crawl-typescript/crawl-java in Group 1.
+- `--skip-joern` — skip Joern CPG pre-analysis even if Joern is installed. Use when Joern parse is slow for a very large repo or when running a quick pass.
+- `--codeql` — optional. Run CodeQL in parallel with find-vulns (Group 2) for exhaustive second-signal confirmation. Requires CodeQL CLI installed. Off by default.
 - `--dast` — optional. After scan-report, generate a DAST test script (`dast-tests.py`) from confirmed findings. Off by default.
 - `--fresh` — force a new scan even if an incomplete prior run exists for this repo. Ignores auto-resume.
 - `--resume <run-id>` — explicitly resume a specific prior run by ID (e.g. `--resume 20260722-103045`). Skips auto-detection.
@@ -111,6 +123,7 @@ Then:
 | `cross-language-taint` | `<run-dir>/findings-raw.json` | `findings.json` |
 | `find-vulns` | `<run-dir>/findings-after-config-audit.json` (if exists) or nothing | `findings.json` |
 | `config-audit` | — (no findings yet) | — |
+| `tree-sitter-crawl` | — (re-run tree-sitter-crawl; no findings yet) | — |
 | `crawl` or `detect-language` | — (start from that step, no artifact to restore) | — |
 
 Also restore `crawl-output.json` from `<run-dir>/crawl-output.json` if the failed step is `find-vulns` or later.
@@ -271,6 +284,88 @@ If `pipeline.crawl` is empty (unknown language), print a warning and stop.
 
 ---
 
+## Step 2a — TREE-SITTER-CRAWL (AST pre-crawl)
+
+**Purpose:** Parse every source file via tree-sitter to produce an enriched `crawl-output.json` with exact AST data — precise role classification, security_priority scores derived from actual dangerous AST node types, exact entry-point parameter maps, and pre-located dangerous patterns. When this step succeeds, the language-specific crawl skills in Group 1 are skipped (their heuristic output is superseded). Joern uses the exact `user_input_sources[]` extracted here as precise taint source hints.
+
+**Run-log:** Log step start before running. On completion/skip log accordingly.
+
+If `--skip-tree-sitter` was passed:
+```
+[0a] tree-sitter-crawl skipped (--skip-tree-sitter) — heuristic crawl skills will run in Group 1
+```
+**Run-log:** Log `status: "skipped"`, `skip_reason: "--skip-tree-sitter flag"`. Set `TREE_SITTER_RAN = false`.
+
+Otherwise: run `/crawl-tree-sitter <repo-path> --manifest language-manifest.json --out crawl-output.json`
+
+**If tree-sitter is not installed** (crawl-tree-sitter writes `crawl-output.json` with `"ts_available": false`):
+- Do NOT treat this as a failure — the pipeline falls back to standard crawl skills in Group 1.
+- Log `status: "skipped"`, `skip_reason: "tree_sitter_not_installed"`.
+- Set `TREE_SITTER_RAN = false`.
+
+**If tree-sitter IS installed and runs successfully** (`ts_available: true` in output):
+- `crawl-output.json` is written with exact AST data, role classifications, and security_priority scores.
+- Copy `crawl-output.json` to `<out-dir>/crawl-output-treesitter.json`.
+- Set `TREE_SITTER_RAN = true`.
+- **Run-log:** Log `"output_artifacts": ["crawl-output-treesitter.json"]` and `"notes": {"files_parsed": N, "parse_errors": N, "priority_5_files": N, "dangerous_patterns_found": N, "user_input_sources_mapped": N}`.
+
+**Resume behavior:** If resuming and `tree-sitter-crawl` already has `status: "completed"` in the prior run-log, skip re-running and restore `crawl-output.json` from `<out-dir>/crawl-output-treesitter.json`. Set `TREE_SITTER_RAN = true`.
+
+Print:
+```
+[0a] tree-sitter-crawl complete — <N> files parsed | <N> priority-5 sinks | <N> user-input sources mapped
+     Joern will use exact parameter taint hints. Group 1 crawl skills skipped (AST data supersedes them).
+```
+or:
+```
+[0a] tree-sitter-crawl skipped — Group 1 will run heuristic crawl-python/crawl-typescript/crawl-java.
+```
+
+---
+
+## Step 2b — JOERN-PARSE (CPG pre-analysis)
+
+**Purpose:** Build a Code Property Graph before crawl so find-vulns skills have a complete taint edge map. Joern is exhaustive — it finds every graph-reachable taint path, including deep multi-hop chains and second-order flows (write in one request, render in another). The LLM then confirms semantics on Joern's pre-mapped paths instead of discovering them blind.
+
+**Run-log:** Log step start before running. On completion/skip log accordingly.
+
+If `--skip-joern` was passed:
+```
+[0b] joern-parse skipped (--skip-joern)
+```
+**Run-log:** Log `status: "skipped"`, `skip_reason: "--skip-joern flag"`.
+
+Otherwise: run `/joern-parse <repo-path> --manifest language-manifest.json --cpg-out cpg-output.json`
+
+**If Joern is not installed** (joern-parse writes `cpg-output.json` with `"available": false`):
+- Do NOT treat this as a failure — the pipeline continues in standard LLM-only mode.
+- Log `status: "skipped"`, `skip_reason: "joern_not_installed"`.
+
+**If Joern IS installed and runs successfully:**
+- `cpg-output.json` is written with `"available": true` and `taint_paths[]`, `call_graph[]`, `unreachable_sinks[]`.
+- Copy `cpg-output.json` to `<out-dir>/cpg-output.json`.
+- **Run-log:** Log `"output_artifacts": ["cpg-output.json"]` and `"notes": {"taint_paths_found": N, "call_graph_edges": N, "unreachable_sinks": N, "languages_analyzed": [...]}`.
+
+**Resume behavior:** If resuming and `joern-parse` already has `status: "completed"` in the prior run-log, skip re-running but restore `cpg-output.json` from `<out-dir>/cpg-output.json` to the working directory before Group 1.
+
+Print:
+```
+[0b] joern-parse complete — <N> taint paths | <N> call graph edges | <N> unreachable sinks
+     CPG taint hints will guide find-vulns file prioritization and path pre-confirmation.
+```
+or:
+```
+[0b] joern-parse skipped — find-vulns will operate in standard LLM-only discovery mode.
+```
+
+**Update auto-resume table:** Add `joern-parse` to the resume artifact table:
+
+| `failed_at_step` | Artifact to restore | Restore as |
+|---|---|---|
+| `joern-parse` | — (no findings yet; re-run joern-parse) | — |
+
+---
+
 ## Step 3 — GROUP 1: CRAWL + CONFIG-AUDIT (parallel)
 
 **Purpose:** Build the attack surface map and audit configuration files simultaneously. These three tasks have no dependencies on each other — crawl skills read source files, config-audit reads only config files.
@@ -278,6 +373,10 @@ If `pipeline.crawl` is empty (unknown language), print a warning and stop.
 **Run-log:** At the start of Group 1, append started entries for ALL Group 1 skills to `run-log.json` together, then execute them and update each to `completed` as it finishes.
 
 ### 3a — Crawl skills (run concurrently)
+
+**If `TREE_SITTER_RAN = true`:** skip all language-specific crawl skills — `crawl-output.json` already exists from Step 2a with exact AST data. Log each crawl skill as `status: "skipped"`, `skip_reason: "superseded by tree-sitter-crawl"`. Jump directly to the Group 1 merge step and the config-audit wait.
+
+**If `TREE_SITTER_RAN = false`:** run the heuristic crawl skills as normal (below).
 
 For each skill in `pipeline.crawl`, run it against `<repo-path>`:
 
@@ -326,13 +425,27 @@ Print:
 
 ---
 
-## Step 4 — GROUP 2: FIND-VULNS (parallel)
+## Step 4 — GROUP 2: FIND-VULNS + CODEQL (parallel)
 
-**Purpose:** Identify candidate vulnerabilities by reading code and reasoning about data flow. All find-vulns skills for this repo can run at the same time — they read the same merged `crawl-output.json` and write to separate output files.
+**Purpose:** Identify candidate vulnerabilities by reading code and reasoning about data flow. find-vulns skills read the merged `crawl-output.json` + `cpg-output.json`. CodeQL (optional) runs simultaneously for exhaustive graph confirmation.
 
-**Hard constraint:** find-vulns skills must derive findings from reading the code. They must never use the `--ground-truth` file or prior knowledge of the repo to generate findings.
+**Hard constraint:** find-vulns skills must derive findings from reading the code. They must never use the `--ground-truth` file or prior knowledge of the repo to generate findings. CPG hints guide WHAT to read — the LLM still reads the code to confirm.
 
-**Run-log:** At the start of Group 2, append started entries for ALL find-vulns skills to `run-log.json` together.
+**Run-log:** At the start of Group 2, append started entries for ALL Group 2 skills (find-vulns + codeql-scan if --codeql) to `run-log.json` together.
+
+### 4a — CodeQL (concurrent with find-vulns, only when --codeql passed)
+
+If `--codeql` was NOT passed:
+**Run-log:** Log `status: "skipped"`, `skip_reason: "--codeql not passed"`.
+
+If `--codeql` was passed: run `/codeql-scan <repo-path> --manifest language-manifest.json` at the same time as find-vulns skills.
+
+codeql-scan appends its findings to `findings.json` and writes `codeql-output.json` once complete.
+Copy `codeql-output.json` to `<out-dir>/codeql-output.json`.
+
+**Run-log:** On completion log `"output_artifacts": ["codeql-output.json"]` and `"notes": {"codeql_results": N, "confirmed_llm_findings": N, "new_cql_findings": N}`.
+
+If CodeQL CLI is not installed, codeql-scan writes a stub and exits cleanly — treat as skipped.
 
 **File naming for concurrent find-vulns:** Each find-vulns skill writes `findings.json`. To prevent overwriting:
 - After each find-vulns skill completes, immediately rename/copy its `findings.json` to `findings-<language>.json` (e.g. `findings-python.json`, `findings-typescript.json`) before the next find-vulns skill runs.
@@ -509,15 +622,19 @@ SAST full scan complete.
   Language  : <language(s)> (<framework(s)>)
 
   Execution groups:
-    Group 1 (parallel) : crawl + config-audit  → <wall-clock savings vs sequential>
-    Group 2 (parallel) : find-vulns skills     → <wall-clock savings vs sequential>
+    Pre-scan           : joern-parse (CPG)      → <N> taint paths pre-mapped (or "skipped")
+    Group 1 (parallel) : crawl + config-audit   → <wall-clock savings vs sequential>
+    Group 2 (parallel) : find-vulns + codeql    → <wall-clock savings vs sequential>
     Group 3 (sequential): cross-lang → taint-trace → validate → report
 
   Pipeline results:
     detect-language       → <languages> detected
-    crawl                 → <N> files mapped, <N> entry points
+    tree-sitter-crawl     → <N> files parsed | <N> priority-5 sinks | <N> input sources (or "skipped")
+    joern-parse           → <N> CPG taint paths | <N> call edges (or "skipped")
+    crawl                 → <N> files mapped, <N> entry points (or "skipped — tree-sitter used")
     config-audit          → <N> configuration findings
-    find-vulns            → <N> candidate findings
+    find-vulns            → <N> candidate findings (<N> CPG-guided / <N> LLM-discovered)
+    codeql-scan           → <N> confirmed LLM findings / <N> new CQL findings (or "skipped")
     cross-language-taint  → <N> cross-boundary findings (or "skipped")
     taint-trace           → <N> confirmed / <N> denied / <N> partial
     validate              → <N> confirmed / <N> likely_real / <N> suppressed
@@ -534,9 +651,11 @@ SAST full scan complete.
 
   Outputs written to <out-dir>/:
     language-manifest.json  — language and framework detection
+    cpg-output.json         — Joern CPG: taint paths + call graph (if Joern ran)
+    codeql-output.json      — CodeQL confirmation results (if --codeql passed)
     crawl-output.json       — file map + routes (merged for polyglot)
     findings-after-config-audit.json — config findings snapshot
-    findings-raw.json       — candidates from find-vulns (merged)
+    findings-raw.json       — candidates from find-vulns (merged, including CQL-*)
     findings-traced.json    — after taint-trace
     findings-validated.json — after scoring + ranking
     findings-final.json     — final enriched findings

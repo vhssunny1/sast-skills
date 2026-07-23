@@ -16,6 +16,50 @@ Read `crawl-output.json`. Extract `repo_path`, `files[]`, `framework`. If missin
 
 ---
 
+## Step 1.5 — Load CPG taint hints (if available)
+
+Check if `cpg-output.json` exists in the current directory.
+
+**If absent or `"available": false`:** skip silently. Proceed with standard LLM discovery.
+
+**If `"available": true`:** load the CPG and apply:
+
+### 1.5a — Boost file priorities by CPG hit count
+
+From `taint_paths[]`, count how many paths involve each file (as `source_file` or `sink_file`).
+Boost `security_priority` in the crawl manifest:
+- ≥ 5 paths → max(existing, 5)
+- 2–4 paths → max(existing, 4)
+- 1 path → max(existing, 3)
+
+### 1.5b — Load call graph
+
+Store `call_graph[]` as `CPG_CALL_GRAPH` (callee_file + callee_method → callers list).
+During Step 3 analysis, check `CPG_CALL_GRAPH` to resolve callers without reading additional files.
+This is especially valuable for Java where Struts2/Spring autowiring makes caller discovery hard.
+
+### 1.5c — Pre-populate CPG candidates
+
+For each entry in `taint_paths[]`, create a pre-candidate with `cpg_guided: true`.
+Do NOT write to `findings.json` yet — confirm via LLM file read in Step 4b first.
+
+### 1.5d — Mark unreachable sinks
+
+Load `unreachable_sinks[]`. Annotate matching files with `cpg_reachable: false`.
+Still analyze (dynamic dispatch, Spring AOP proxies can defeat CPG reachability), but flag findings accordingly.
+
+Print:
+```
+  CPG taint hints loaded:
+    Taint paths        : <N>
+    Call graph edges   : <N>
+    Unreachable sinks  : <N>
+    Files re-prioritized: <N>
+    CPG candidates     : <N> pre-mapped paths to confirm
+```
+
+---
+
 ## Step 2 — Build the scan queue
 
 Analyze files in this priority order:

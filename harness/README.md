@@ -171,13 +171,16 @@ The progress panel updates in real time as each skill runs. You do not need to r
 ⟳  crawl-typescript      read_file: package.json              ← running concurrently
 ⟳  config-audit          running...                           ← running concurrently
 
-✓  find-vulns-python     12 findings
-✓  find-vulns-typescript  8 findings
+✓  find-vulns-python-batch1of3     41s — +9 findings
+✓  find-vulns-python-batch2of3     52s — +3 findings
+✓  find-vulns-typescript-batch1of6 89s — +8 findings
 
-✓  taint-trace           17 confirmed / 3 denied
-✓  validate-findings     18 confirmed / 2 suppressed
-✓  scan-report           scan-results.sarif + scan-summary.md
+✓  taint-trace           10m 5s — 17 confirmed / 3 denied
+✓  validate-findings     13m 27s — 18 confirmed / 2 suppressed
+✓  scan-report           8m 8s — scan-results.sarif + scan-summary.md
 ```
+
+Every step shows its own **duration** and **findings delta** as it completes, both live and when reviewing a scan from history. `find-vulns-*` steps appear as multiple `-batchNofM` rows when the repo has more than 40 files at `security_priority ≥ 2` — this is intentional: each batch is a separate agent invocation so coverage is guaranteed rather than left to a single turn's self-pacing.
 
 Icons:
 - `⟳` — currently running
@@ -211,7 +214,11 @@ Click any entry to view its step-by-step breakdown and re-download its result fi
 
 ### Step 7 — Cancel a running scan
 
-While a scan is in progress, a **Cancel** button appears in the top-right of the progress panel. Clicking it stops the scan. The partial results are saved — the next run of the same repo will auto-resume from where it left off.
+While a scan is in progress, a **Cancel** button appears in the top-right of the progress panel. Clicking it actually stops the pipeline — it cancels the background task and kills its in-flight `claude` subprocess (not just closing the live-progress connection). The partial results are saved — the next run of the same repo will auto-resume from where it left off.
+
+### Step 8 — Delete a scan
+
+Hover any entry in the sidebar to reveal a small **×** delete button — this permanently removes that scan's run directory from disk (cancelling it first if still running). Use **Clear all** in the sidebar header to wipe the entire scan history at once. Deletion is separate from cancelling: cancel stops a running scan but keeps its partial artifacts for resume; delete removes the artifacts entirely.
 
 ---
 
@@ -292,6 +299,8 @@ curl -O http://localhost:8000/api/scans/20260722-103045/files/scan-summary.md \
   -H "Authorization: Bearer $TOKEN"
 ```
 
+For a plain browser link (new tab, no way to set a header), pass the token as a query param instead: `?token=$TOKEN`.
+
 Available filenames: `scan-summary.md`, `scan-results.sarif`, `findings-final.json`, `findings-validated.json`, `run-log.json`, `dast-tests.py`
 
 ### Cancel a running scan
@@ -300,6 +309,26 @@ Available filenames: `scan-summary.md`, `scan-results.sarif`, `findings-final.js
 curl -X DELETE http://localhost:8000/api/scans/20260722-103045 \
   -H "Authorization: Bearer $TOKEN"
 ```
+
+Cancels the background task and kills its in-flight `claude` subprocess. Partial artifacts are kept for auto-resume.
+
+### Delete a scan permanently
+
+```bash
+curl -X DELETE http://localhost:8000/api/scans/20260722-103045/purge \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Cancels first if still running, then removes the run's entire directory from disk.
+
+### Delete all scans
+
+```bash
+curl -X DELETE http://localhost:8000/api/scans \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Cancels every active scan and wipes all run history.
 
 ---
 

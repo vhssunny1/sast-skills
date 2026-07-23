@@ -45,6 +45,22 @@ Scan the first 100 lines for these markers:
 
 ---
 
+## Security priority scoring (per file)
+
+While reading the first 100 lines for role classification, also assign `security_priority` (1–5) based on dangerous patterns seen:
+
+| Score | Indicators |
+|---|---|
+| 5 | `Runtime.exec(`, `ProcessBuilder`, `ObjectInputStream.readObject(`, `XMLDecoder`, OGNL evaluation (Struts2 `%{...}` with user input), `fromJson(` on untrusted input |
+| 4 | `createNativeQuery(`/HQL-JPQL string concatenation, `response.sendRedirect(` with a variable target, `MessageDigest.getInstance("MD5"``/``"SHA1")`, missing `@PreAuthorize`/`@Secured` on a sensitive endpoint, JSP `<%= %>` or `out.print(` with request-derived data |
+| 3 | `prepareStatement(`/`createQuery(` with bound parameters, `EntityManager`/`JdbcTemplate` query methods, file I/O built from a request parameter, `logger.info/debug(` including a token or password variable |
+| 2 | `@Entity`/`@Table` model classes with custom validation logic, `@Service` business logic with no obvious sink, standard DAO CRUD methods |
+| 1 | Pure POJOs (`@Entity` with only fields + getters/setters), DTOs, generated code, constants |
+
+`find-vulns-java` reads files in descending `security_priority` order within each role tier, and every file at `security_priority` ≥ 2 must receive a full read pass — only priority-1 files may be skipped.
+
+---
+
 ## Step 3 — Extract routes from entry_point files
 
 For each entry_point file, read the full file and extract:
@@ -103,7 +119,8 @@ Write to `crawl-output.json` in the current working directory. Overwrite if exis
       "path": "src/main/java/com/example/UserController.java",
       "role": "entry_point",
       "lines": 120,
-      "language": "java"
+      "language": "java",
+      "security_priority": 4
     }
   ],
   "dependencies": [
@@ -136,6 +153,7 @@ crawl-java complete.
   Entry points: <N> routes across <N> controller files
   Services    : <N> files
   DAOs        : <N> files
+  High-priority : <N> files with security_priority ≥ 4
   Flagged deps: <list>
   Output      : crawl-output.json
 ```

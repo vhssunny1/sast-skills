@@ -6,8 +6,8 @@ from typing import Callable, Awaitable
 
 import config
 
-# Timeout per skill in seconds — large repos may need longer
-SKILL_TIMEOUT = int(config.MAX_SKILL_ITERATIONS) * 30  # ~30 min max
+# Timeout per skill in seconds — 2 hours to handle large repos (400+ file TypeScript scans)
+SKILL_TIMEOUT = 7200
 
 
 async def run_skill(
@@ -57,6 +57,9 @@ async def run_skill(
         except asyncio.TimeoutError:
             proc.kill()
             raise RuntimeError(f"Skill '{skill_name}' timed out after {SKILL_TIMEOUT}s")
+        except asyncio.CancelledError:
+            proc.kill()
+            raise
 
         if proc.returncode != 0:
             err = stderr.decode(errors="replace")[:600]

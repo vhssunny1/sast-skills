@@ -4,9 +4,16 @@ import asyncio
 import json
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+# uvicorn --reload switches the event loop to WindowsSelectorEventLoop on Windows,
+# which cannot spawn subprocesses (NotImplementedError). Every skill invocation
+# shells out to `claude`, so force ProactorEventLoop regardless of --reload.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import FileResponse, HTMLResponse
@@ -24,6 +31,8 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 
 # in-memory registry of active scan queues  {run_id: asyncio.Queue}
 _active_queues: dict[str, asyncio.Queue] = {}
+# in-memory registry of the background pipeline task per run {run_id: asyncio.Task}
+_active_tasks: dict[str, asyncio.Task] = {}
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -44,22 +53,43 @@ class ScanRequest(BaseModel):
     ground_truth: Optional[str] = None
     skip_taint: bool = False
     skip_config_audit: bool = False
+    skip_tree_sitter: bool = False
+    skip_joern: bool = False
+    codeql: bool = False
     dast: bool = False
     fresh: bool = False
     resume_run_id: Optional[str] = None
 
 
-def _clone_or_pull(git_url: str) -> Path:
-    """Clone the repo if not present, pull if it is. Returns local path."""
+def _resolve_repo(source: str) -> Path:
+    """
+    Accept either a local folder path or a GitHub/git URL.
+    - Local path: must exist as a directory, used directly.
+    - URL (http/https/git@): cloned into REPOS_DIR (pulled if already cloned).
+    """
+    # Detect local path: exists on disk, or starts with drive letter / UNC / Unix root
+    local = Path(source)
+    if local.exists() and local.is_dir():
+        return local.resolve()
+
+    # Treat as git URL
+    if not (source.startswith("http://") or source.startswith("https://")
+            or source.startswith("git@") or source.startswith("git://")):
+        raise RuntimeError(
+            f"Not a valid local path or git URL: {source!r}\n"
+            "Provide a local folder path (e.g. C:/Users/.../juice-shop) "
+            "or a full GitHub URL (e.g. https://github.com/org/repo.git)"
+        )
+
     config.REPOS_DIR.mkdir(parents=True, exist_ok=True)
-    repo_name = git_url.rstrip("/").split("/")[-1].removesuffix(".git")
+    repo_name = source.rstrip("/").split("/")[-1].removesuffix(".git")
     repo_path = config.REPOS_DIR / repo_name
     if repo_path.exists():
         subprocess.run(["git", "-C", str(repo_path), "pull", "--ff-only"],
                        capture_output=True, timeout=120)
     else:
         result = subprocess.run(
-            ["git", "clone", "--depth", "1", git_url, str(repo_path)],
+            ["git", "clone", "--depth", "1", source, str(repo_path)],
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode != 0:
@@ -79,7 +109,7 @@ async def start_scan(req: ScanRequest):
     async def run():
         try:
             repo_path = await asyncio.get_event_loop().run_in_executor(
-                None, _clone_or_pull, req.git_url
+                None, _resolve_repo, req.git_url
             )
             await run_pipeline(
                 run_id=run_id,
@@ -89,17 +119,24 @@ async def start_scan(req: ScanRequest):
                 ground_truth=req.ground_truth,
                 skip_taint=req.skip_taint,
                 skip_config_audit=req.skip_config_audit,
+                skip_tree_sitter=req.skip_tree_sitter,
+                skip_joern=req.skip_joern,
+                codeql=req.codeql,
                 dast=req.dast,
                 fresh=req.fresh,
                 resume_run_id=req.resume_run_id,
             )
+        except asyncio.CancelledError:
+            pass
         except Exception as exc:
             await emit({"type": "fatal_error", "error": str(exc)})
         finally:
             await queue.put(None)   # sentinel — stream is done
             _active_queues.pop(run_id, None)
+            _active_tasks.pop(run_id, None)
 
-    asyncio.create_task(run())
+    task = asyncio.create_task(run())
+    _active_tasks[run_id] = task
     return {"run_id": run_id}
 
 
@@ -164,9 +201,15 @@ async def get_scan(run_id: str):
     return json.loads(log_file.read_text())
 
 
-@app.get("/api/scans/{run_id}/files/{filename}", dependencies=[Depends(auth.get_current_user)])
-async def download_file(run_id: str, filename: str):
-    """Download an output artifact from a completed run."""
+@app.get("/api/scans/{run_id}/files/{filename}")
+async def download_file(run_id: str, filename: str, token: str = ""):
+    """Download an output artifact from a completed run.
+
+    Browsers navigating a plain <a href> link (new tab / direct download)
+    can't attach an Authorization header, so accept the JWT via ?token= too,
+    same as the SSE stream endpoint.
+    """
+    auth.get_current_user(token)
     allowed = {
         "scan-summary.md", "scan-results.sarif", "findings-final.json",
         "findings-raw.json", "findings-validated.json", "run-log.json",
@@ -180,14 +223,53 @@ async def download_file(run_id: str, filename: str):
     return FileResponse(path, filename=filename)
 
 
-@app.delete("/api/scans/{run_id}", dependencies=[Depends(auth.get_current_user)])
-async def cancel_scan(run_id: str):
-    """Signal a running scan to stop by closing its queue."""
+async def _stop_run(run_id: str):
+    """Cancel the background pipeline task (which kills its in-flight subprocess) and its SSE queue."""
+    task = _active_tasks.pop(run_id, None)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
     if run_id in _active_queues:
         await _active_queues[run_id].put(None)
         _active_queues.pop(run_id, None)
-        return {"cancelled": True}
-    return {"cancelled": False, "note": "scan not active"}
+        return True
+    return False
+
+
+@app.delete("/api/scans/{run_id}", dependencies=[Depends(auth.get_current_user)])
+async def cancel_scan(run_id: str):
+    """Stop a running scan: cancels its task (killing any in-flight `claude` subprocess)."""
+    stopped = await _stop_run(run_id)
+    return {"cancelled": stopped} if stopped else {"cancelled": False, "note": "scan not active"}
+
+
+@app.delete("/api/scans/{run_id}/purge", dependencies=[Depends(auth.get_current_user)])
+async def purge_scan(run_id: str):
+    """Cancel if active, then permanently delete the run's artifacts from disk."""
+    await _stop_run(run_id)
+    run_dir = config.RUNS_DIR / run_id
+    if not run_dir.exists():
+        raise HTTPException(404, "Run not found")
+    shutil.rmtree(run_dir, ignore_errors=True)
+    return {"deleted": run_id}
+
+
+@app.delete("/api/scans", dependencies=[Depends(auth.get_current_user)])
+async def purge_all_scans():
+    """Cancel every active scan and delete all run artifacts from disk."""
+    for run_id in list(_active_tasks.keys()):
+        await _stop_run(run_id)
+
+    deleted = []
+    if config.RUNS_DIR.exists():
+        for run_dir in config.RUNS_DIR.iterdir():
+            if run_dir.is_dir():
+                shutil.rmtree(run_dir, ignore_errors=True)
+                deleted.append(run_dir.name)
+    return {"deleted": deleted, "count": len(deleted)}
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────

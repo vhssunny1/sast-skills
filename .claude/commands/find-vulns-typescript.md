@@ -16,6 +16,62 @@ Read `crawl-output.json`. Extract `repo_path`, `files[]`, `framework`. If missin
 
 ---
 
+## Step 1.5 — Load CPG taint hints (if available)
+
+Check if `cpg-output.json` exists in the current directory.
+
+**If `cpg-output.json` is absent or has `"available": false`:** skip this step silently. Proceed with standard LLM discovery (existing behavior).
+
+**If `"available": true`:** load the CPG and apply the following:
+
+### 1.5a — Build a CPG-priority file list
+
+From `cpg-output.json`, extract `taint_paths[]`. For each path, collect `source_file` and `sink_file`. Count how many taint paths involve each file.
+
+Build a map: `{ "<file-path>": <taint_path_count> }`. Files with more CPG-confirmed taint paths score higher.
+
+**Boost `security_priority`** for each file in `crawl-output.json` that appears in this map:
+- `taint_path_count` ≥ 5 → set `security_priority` to max(existing, 5)
+- `taint_path_count` 2–4 → set `security_priority` to max(existing, 4)
+- `taint_path_count` 1 → set `security_priority` to max(existing, 3)
+
+This re-ordering ensures files with CPG-confirmed taint paths are analyzed first in Step 2's scan queue.
+
+### 1.5b — Load call graph for cross-file tracing
+
+From `cpg-output.json`, load `call_graph[]`. Store this as `CPG_CALL_GRAPH` (a map of `callee_file + callee_method → [callers]`).
+
+During analysis in Step 4, when you need to find callers of a dangerous function, check `CPG_CALL_GRAPH` first before reading additional files. If the call graph already maps the callers, use those entries directly without a file read.
+
+### 1.5c — Pre-populate CPG-confirmed candidate findings
+
+For each entry in `taint_paths[]`:
+- Create a **pre-candidate finding** with:
+  - `cpg_path_id` — index in `taint_paths[]`
+  - `source_file`, `source_line`, `sink_file`, `sink_line`, `sink_type`
+  - `hop_count`, `steps[]` from the CPG path
+  - `cpg_guided: true` — marks this as a CPG-originated candidate
+
+Store these as `CPG_CANDIDATES`. Do NOT add them to `findings.json` yet — they become findings only after LLM semantic confirmation in Step 4.
+
+### 1.5d — Mark unreachable sinks
+
+From `cpg-output.json`, load `unreachable_sinks[]`. For any file in this list that also appears in the scan queue, annotate it:
+- Still read the file (CPG unreachability has false negatives for dynamic dispatch)
+- Mark findings from that file with `"cpg_reachable": false` — validate-findings will weigh this in `fp_score`
+
+Print:
+```
+  CPG taint hints loaded:
+    Taint paths        : <N>
+    Call graph edges   : <N>
+    Unreachable sinks  : <N> (will still be analyzed, deprioritized)
+    Files re-prioritized: <N> files boosted by CPG hit count
+    CPG candidates     : <N> pre-mapped source→sink paths to confirm
+```
+
+---
+
 ## Step 2 — Build the scan queue
 
 Analyze files in this priority order:
@@ -188,19 +244,39 @@ Flag at medium severity. Fix: always cap loops with `Math.min(userCount, MAX_ALL
 
 ---
 
+## Step 4b — Confirm CPG candidates
+
+After the main analysis loop (Step 4), process any remaining `CPG_CANDIDATES` that did not match a finding already discovered:
+
+For each unmatched CPG candidate:
+1. Read `source_file` (if not already read during Step 4)
+2. Verify: does the `source_line` contain attacker-controlled input as described?
+3. Read `sink_file` (if not already read) — verify the sink is real and unsanitized
+4. If confirmed: create a full finding from the CPG candidate. Set `cpg_guided: true`, populate `evidence`, `description`, `fix_hint` from code reading.
+5. If denied (sanitization exists, or CPG path is a false positive): discard. Do NOT create a finding.
+
+This ensures CPG-discovered paths that the main scan queue would have reached eventually are confirmed without double-reading files already visited.
+
+---
+
 ## Step 5 — Score, deduplicate, assign IDs
 
 **Confidence:**
-- 0.90–1.00 — source and sink in same file/component, direct taint, no sanitization visible
+- 0.95–1.00 — source and sink in same file/component, direct taint, CPG also confirmed (`cpg_guided: true`)
+- 0.90–0.94 — direct taint, LLM-only discovery (no CPG hint)
 - 0.70–0.89 — one prop or variable hop between source and sink
 - 0.50–0.69 — indirect path, cross-component, sanitization may exist in parent
 - < 0.50 — discard
 
 **Filter:** ≥ 0.70 report; 0.50–0.69 report with `confidence_note: "indirect — verify manually"`.
 
-**Deduplicate:** same CWE + same file + same line ±3 → keep higher confidence.
+**Deduplicate:** same CWE + same file + same line ±3 → keep higher confidence. If one duplicate has `cpg_guided: true` and the other does not, keep the `cpg_guided` one (it has the CPG path in its metadata).
 
 **Number:** `FINDING-001`, `FINDING-002`, ...
+
+**CPG stats to track for output:**
+- `cpg_guided_count` — findings that originated from or were confirmed by CPG candidates
+- `llm_discovered_count` — findings found purely by LLM discovery (no CPG hint)
 
 **CWE/OWASP mapping:**
 
@@ -284,9 +360,13 @@ Write to `findings.json` in the current working directory. Overwrite if exists.
   "repo_path": "<absolute path>",
   "language": "typescript",
   "crawl_input": "./crawl-output.json",
+  "cpg_input": "./cpg-output.json",
+  "cpg_available": true,
   "total_findings": 0,
   "files_attempted": 42,
   "files_in_manifest": 45,
+  "cpg_guided_count": 8,
+  "llm_discovered_count": 12,
   "files_skipped": [
     { "path": "src/generated/api.ts", "reason": "security_priority 1 — generated code" }
   ],
@@ -297,10 +377,13 @@ Write to `findings.json` in the current working directory. Overwrite if exists.
       "cwe": "CWE-79",
       "owasp": "A03:2021",
       "severity": "medium",
-      "confidence": 0.75,
+      "confidence": 0.95,
       "confidence_note": "",
       "cvss_vector": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N",
       "cvss_score": 4.8,
+      "cpg_guided": true,
+      "cpg_path_id": 3,
+      "cpg_reachable": true,
       "file": "frontend/src/components/chat/ChatComponent.tsx",
       "line": 6,
       "method": "mermaid.initialize",
@@ -316,6 +399,13 @@ Write to `findings.json` in the current working directory. Overwrite if exists.
   "warnings": []
 }
 ```
+
+**New fields:**
+- `cpg_input` — path to CPG file used (or `null` if CPG unavailable)
+- `cpg_available` — whether CPG hints were loaded
+- `cpg_guided_count` — findings that used CPG taint path as input
+- `llm_discovered_count` — findings found purely by LLM (no CPG hint)
+- Per finding: `cpg_guided` (bool), `cpg_path_id` (index into `taint_paths[]`), `cpg_reachable` (from unreachable_sinks list)
 
 ---
 
@@ -333,9 +423,12 @@ Write to `findings.json` in the current working directory. Overwrite if exists.
 
 ```
 find-vulns-typescript complete.
-  Repo          : <repo_path>
-  Files scanned : <N> TypeScript + <N> JavaScript files
+  Repo           : <repo_path>
+  Files scanned  : <N> TypeScript + <N> JavaScript files
   Files attempted: <N> / <total_in_manifest> (<skipped> skipped — priority 1 only)
-  Findings      : <total> (<critical> critical / <high> high / <medium> medium / <low> low)
-  Output        : findings.json
+  CPG mode       : <enabled — N taint paths pre-loaded | disabled — LLM-only discovery>
+  Findings       : <total> (<critical> critical / <high> high / <medium> medium / <low> low)
+    CPG-guided   : <N>  (Joern path confirmed by LLM read)
+    LLM-only     : <N>  (discovered without CPG hint — dynamic dispatch, reflection, etc.)
+  Output         : findings.json
 ```
