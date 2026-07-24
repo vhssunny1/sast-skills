@@ -519,7 +519,7 @@ If `--skip-taint` was passed:
 ```
 **Run-log:** Log `status: "skipped"`, `skip_reason: "--skip-taint flag"`.
 
-Otherwise: run `/taint-trace --findings findings.json --crawl crawl-output.json`
+Otherwise: run `/taint-trace --findings findings.json --crawl crawl-output.json --cpg cpg-output.json`
 
 Enriches `findings.json` in place. Copy to `<out-dir>/findings-traced.json`.
 

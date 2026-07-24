@@ -288,31 +288,44 @@ Add `deployment_context` field to each config finding:
 
 ## Step 5 — Write findings
 
-Append to `findings.json` (create if not exists). Use the same schema as find-vulns but with `source: "configuration"`:
+`findings.json` is always a single JSON **object** with a top-level `findings` array — never a bare array. This matters: downstream skills (find-vulns-*, taint-trace, validate-findings) all read `findings.json` expecting this object shape.
+
+**If `findings.json` does not exist:** create it with this full object schema:
 
 ```json
 {
-  "id": "CONFIG-001",
-  "cwe": "CWE-16",
-  "owasp": "A05:2021",
-  "severity": "high",
-  "confidence": 0.95,
-  "confidence_note": "",
-  "file": ".env",
-  "line": 4,
-  "method": "environment",
-  "source": "REDASH_REMOTE_USER_LOGIN_ENABLED env var",
-  "sink": "remote_user_auth.py — login() endpoint trusts X-Forwarded-Remote-User header without signature verification",
-  "sanitization_present": "none — feature is active unconditionally when this var is true",
-  "evidence": "REDASH_REMOTE_USER_LOGIN_ENABLED=true",
-  "description": "Remote user authentication is enabled. When the backend port is directly reachable (common in Docker deployments), any attacker can authenticate as any user by forging the X-Forwarded-Remote-User header.",
-  "fix_hint": "Set REDASH_REMOTE_USER_LOGIN_ENABLED=false unless SSO proxy is deployed, or add HMAC signature verification to the remote_user_auth.py login endpoint.",
-  "condition": "REDASH_REMOTE_USER_LOGIN_ENABLED=true",
-  "deployment_context": "production_config",
-  "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
-  "cvss_score": 9.1
+  "scanned_at": "<ISO 8601>",
+  "repo_path": "<absolute path>",
+  "language": "config",
+  "total_findings": 1,
+  "findings_by_severity": { "critical": 0, "high": 1, "medium": 0, "low": 0 },
+  "findings": [
+    {
+      "id": "CONFIG-001",
+      "cwe": "CWE-16",
+      "owasp": "A05:2021",
+      "severity": "high",
+      "confidence": 0.95,
+      "confidence_note": "",
+      "file": ".env",
+      "line": 4,
+      "method": "environment",
+      "source": "REDASH_REMOTE_USER_LOGIN_ENABLED env var",
+      "sink": "remote_user_auth.py — login() endpoint trusts X-Forwarded-Remote-User header without signature verification",
+      "sanitization_present": "none — feature is active unconditionally when this var is true",
+      "evidence": "REDASH_REMOTE_USER_LOGIN_ENABLED=true",
+      "description": "Remote user authentication is enabled. When the backend port is directly reachable (common in Docker deployments), any attacker can authenticate as any user by forging the X-Forwarded-Remote-User header.",
+      "fix_hint": "Set REDASH_REMOTE_USER_LOGIN_ENABLED=false unless SSO proxy is deployed, or add HMAC signature verification to the remote_user_auth.py login endpoint.",
+      "condition": "REDASH_REMOTE_USER_LOGIN_ENABLED=true",
+      "deployment_context": "production_config",
+      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+      "cvss_score": 9.1
+    }
+  ]
 }
 ```
+
+**If `findings.json` already exists:** read it first. If it is already an object with a `findings` array, append your new finding objects (using the same per-finding shape shown above) to that existing array — do not discard what's already there. If the existing file is a bare array (a malformed leftover from an older run), treat its elements as the existing findings list and wrap them into the object schema above when you write back. Either way, recompute `total_findings` and `findings_by_severity` from the complete combined list before writing.
 
 **CWE mapping for config findings:**
 

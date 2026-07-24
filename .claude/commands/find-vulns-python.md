@@ -22,15 +22,14 @@ Check if `cpg-output.json` exists in the current directory.
 
 **If absent or `"available": false`:** skip silently. Proceed with standard LLM discovery.
 
-**If `"available": true`:** load the CPG and apply:
+**If `"available": true`:** load the CPG and apply. Check for `"degraded": true` first — if present, `taint_paths[]`/`unreachable_sinks[]` are always empty (a known upstream Joern limitation — see `harness/scripts/joern_extract.sc`'s header comment). In that case `sinks_found[]` is the populated signal; the steps below use whichever arrays are non-empty without special branching.
 
 ### 1.5a — Boost file priorities by CPG hit count
 
-From `taint_paths[]`, count how many paths involve each file (as `source_file` or `sink_file`).
-Boost `security_priority` in the crawl manifest:
-- ≥ 5 paths → max(existing, 5)
-- 2–4 paths → max(existing, 4)
-- 1 path → max(existing, 3)
+Build a per-file hit count from **both** `taint_paths[]` (source_file/sink_file, if non-empty) and `sinks_found[]` (file, if non-empty — a sink location with no traced source, still real CPG signal). Boost `security_priority` in the crawl manifest:
+- ≥ 5 combined hits → max(existing, 5)
+- 2–4 combined hits → max(existing, 4)
+- 1 combined hit → max(existing, 3)
 
 ### 1.5b — Load call graph
 
@@ -39,22 +38,24 @@ During Step 4 analysis, check `CPG_CALL_GRAPH` before reading additional files t
 
 ### 1.5c — Pre-populate CPG candidates
 
-For each entry in `taint_paths[]`, create a pre-candidate with `cpg_guided: true`.
-Do NOT write to `findings.json` yet — confirm semantics via LLM file read in Step 4b first.
+For each entry in `taint_paths[]` (full traced flow): create a pre-candidate with `cpg_guided: true, cpg_source_confirmed: true`.
+For each entry in `sinks_found[]` not already covered by a `taint_paths[]` hit at the same file+line (the primary signal in degraded mode): create a lighter pre-candidate — `sink_file`, `sink_line`, `sink_type` only, no traced source — with `cpg_guided: true, cpg_source_confirmed: false`; you still must find and confirm the source yourself.
+Do NOT write to `findings.json` yet — confirm semantics via LLM file read in Step 4b first. Preserve `cpg_guided`/`cpg_source_confirmed` through to `findings.json` in Step 6 — `validate-findings`/`scan-report` read them.
 
 ### 1.5d — Mark unreachable sinks
 
-Load `unreachable_sinks[]`. Annotate matching files in the scan queue with `cpg_reachable: false`.
+Load `unreachable_sinks[]` (always empty in degraded mode). Annotate matching files in the scan queue with `cpg_reachable: false`.
 Still analyze these files (CPG has false negatives for dynamic dispatch / decorators), but mark findings from them accordingly.
 
 Print:
 ```
-  CPG taint hints loaded:
+  CPG taint hints loaded: (degraded: <true/false>)
     Taint paths        : <N>
+    Sinks found        : <N>
     Call graph edges   : <N>
     Unreachable sinks  : <N>
     Files re-prioritized: <N>
-    CPG candidates     : <N> pre-mapped paths to confirm
+    CPG candidates     : <N> pre-mapped (<N> full traced, <N> sink-only)
 ```
 
 ---

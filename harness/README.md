@@ -4,6 +4,27 @@ A FastAPI web server that runs the SAST pipeline as an agentic service. Point it
 
 ---
 
+## CLI mode (no web server)
+
+Prefer a terminal to a browser, or running headlessly on a server with no port exposed?
+`cli.py` runs the exact same orchestrator (`pipeline.py` — same auto-resume, batching, and
+raw-output logging) and prints progress straight to stdout instead of streaming over SSE.
+No login, no FastAPI/uvicorn install required — `cli.py` only imports the standard library
+plus `pipeline.py`/`agent.py`/`config.py`, which have zero third-party dependencies.
+
+```bash
+cd harness
+python3 cli.py <repo-path-or-git-url>
+python3 cli.py <repo-path-or-git-url> --skip-joern --dast
+```
+
+See `python3 cli.py --help` for the full flag list (mirrors the web UI's scan options), and
+[../docs/LINUX-DEPLOYMENT.md](../docs/LINUX-DEPLOYMENT.md) for a complete fresh-VPS setup
+walkthrough (Node/tree-sitter/Joern/claude CLI installation and the real gotchas hit getting
+each one working headlessly).
+
+---
+
 ## Prerequisites
 
 - Python 3.11+

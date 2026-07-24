@@ -382,3 +382,8 @@ The key insight: Joern guarantees **recall** (no missed paths). The LLM guarante
 - **Optional:** [Joern](https://docs.joern.io/installation) — for CPG pre-analysis (auto-detected)
 - **Optional:** [CodeQL CLI](https://github.com/github/codeql-cli-binaries/releases) — for second-signal confirmation (`--codeql` flag)
 - **Optional:** [tree-sitter CLI](https://github.com/tree-sitter/tree-sitter/blob/master/cli/README.md) — for the fast mechanical pre-crawl (auto-detected). On Windows, grammar compilation requires a C compiler with Windows SDK headers (e.g. Visual Studio Build Tools) — without one, tree-sitter falls back gracefully to the standard LLM crawl.
+
+**Deploying on a fresh Linux box / VPS?** See [docs/LINUX-DEPLOYMENT.md](docs/LINUX-DEPLOYMENT.md)
+for a complete step-by-step walkthrough (Node/tree-sitter/Joern/claude CLI install, a headless
+CLI runner with no web server, and the real gotchas hit setting this up from scratch — glibc
+version mismatches, permission/sandbox trust, etc.).

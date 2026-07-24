@@ -1,6 +1,18 @@
 Build a Code Property Graph (CPG) from the target repository using Joern and export a machine-readable taint edge + call graph summary that downstream find-vulns skills consume.
 
-This skill runs AFTER detect-language and BEFORE Group 1 crawl. It provides exhaustive graph coverage so find-vulns skills do not miss taint paths that require following chains across many files. The LLM still reads source files for semantic confirmation — the CPG provides the roadmap.
+This skill runs AFTER detect-language and BEFORE Group 1 crawl. It provides exhaustive graph coverage so find-vulns skills do not miss taint paths that require following chains across many files. The LLM still reads source files for semantic confirmation in find-vulns-* — the CPG provides the roadmap.
+
+**This skill is a deterministic script, not an LLM analysis step.** Locating the Joern binary, building the CPG, running the taint-extraction query, and relaying its JSON output were always mechanical operations — the only thing that varied was the LLM re-writing the query script fresh each run. The query script is now `harness/scripts/joern_extract.sc`, checked into the repo (byte-identical every invocation), and `harness/scripts/joern_parse.py` runs the whole sequence as real code.
+
+## Your job
+
+1. Run:
+   ```bash
+   python3 harness/scripts/joern_parse.py <repo-path> --manifest language-manifest.json --cpg-out cpg-output.json
+   ```
+   (paths relative to your working directory; use absolute paths if unsure). If `harness/scripts/joern_parse.py` is not found relative to the current directory, locate it under the repo root's `harness/scripts/` and use that path instead. Pass `--joern-bin <path>` if Joern isn't on `$PATH`.
+2. Read the resulting `cpg-output.json` and relay/summarize it.
+3. Print the script's own stdout summary verbatim (taint paths found, call graph edges, unreachable sinks, top sink types) — do not recompute these from the JSON yourself.
 
 ## Input
 
@@ -11,19 +23,15 @@ This skill runs AFTER detect-language and BEFORE Group 1 crawl. It provides exha
 - `--cpg-out <path>` — where to write `cpg-output.json` (default: `./cpg-output.json`)
 - `--joern-bin <path>` — path to Joern installation (default: auto-detect from `$PATH` and common install locations)
 
----
+Pass these through to the script unchanged.
 
-## Step 1 — Detect Joern installation
+## If Joern is not installed / not supported for this language
 
-Check for Joern in this order:
-
-1. `$JOERN_HOME/bin/joern` if `$JOERN_HOME` is set
-2. `joern` on `$PATH` (run `joern --version`)
-3. `~/.local/share/joern/joern-cli/joern`
-4. `/opt/joern/joern-cli/joern`
-5. Value of `--joern-bin` flag
-
-If Joern is not found:
+The script itself detects this and writes a stub to the output path, then exits 0 — do not treat this as a failure:
+```json
+{ "available": false, "reason": "joern_not_installed", "repo_path": "<repo-path>", "generated_at": "<ISO 8601>" }
+```
+Relay its printed message:
 ```
 joern-parse: Joern not installed — CPG analysis skipped.
   Install: https://docs.joern.io/installation
@@ -31,183 +39,7 @@ joern-parse: Joern not installed — CPG analysis skipped.
   To suppress this warning: pass --skip-joern to sast-full-scan.
 ```
 
-Write a **stub** `cpg-output.json` with `"available": false` so downstream skills know CPG was attempted but unavailable:
-```json
-{
-  "available": false,
-  "reason": "joern_not_installed",
-  "repo_path": "<repo-path>",
-  "generated_at": "<ISO 8601>"
-}
-```
-Stop — do not error. The pipeline continues without CPG.
-
----
-
-## Step 2 — Determine language scope
-
-Read `language-manifest.json`. Extract `languages[]` and `primary_language`.
-
-Map to Joern language flags:
-
-| Language | Joern flag |
-|---|---|
-| `typescript` or `javascript` | `--language javascript` |
-| `python` | `--language python` |
-| `java` or `kotlin` | `--language java` |
-| Polyglot | Run Joern once per language; merge outputs |
-
-If language is not supported by Joern (Go, Ruby, C#), write stub with `"reason": "language_not_supported"` and stop.
-
----
-
-## Step 3 — Build CPG database
-
-For each language in scope, run:
-
-```bash
-joern-parse <repo-path> \
-  --language <joern-lang-flag> \
-  --output ./joern-cpg-<language>.bin \
-  --exclude-regex "node_modules|dist|build|__pycache__|\.venv|test|spec|\.git"
-```
-
-If `joern-parse` exits non-zero:
-- Log the error message
-- Write stub with `"reason": "parse_failed"`, `"error": "<stderr output>"`
-- Stop — pipeline continues without CPG
-
-Expected output: `./joern-cpg-<language>.bin` — binary CPG database.
-
----
-
-## Step 4 — Extract taint paths
-
-For each CPG database, run the Joern query script below via:
-```bash
-joern --script joern-extract.sc \
-      --params "cpgFile=./joern-cpg-<language>.bin,outFile=./cpg-paths-<language>.json"
-```
-
-**`joern-extract.sc` content** — write this script to disk before executing:
-
-```scala
-// joern-extract.sc
-// Extracts taint paths, call graph edges, and unreachable sinks from a CPG.
-
-import java.io._
-import scala.util.Try
-
-val cpgFile = params("cpgFile")
-val outFile = params("outFile")
-
-val cpg = loadCpg(cpgFile)
-
-// ── Taint sources ──────────────────────────────────────────────────────
-val httpSources = cpg.call
-  .name("(get|post|put|delete|patch)")
-  .where(_.argument.code("req\\.(body|query|params|headers|cookies).*"))
-  .l
-
-val paramSources = cpg.identifier
-  .where(_.code("req\\.(body|query|params|headers).*"))
-  .l
-
-// ── Taint sinks ────────────────────────────────────────────────────────
-val sqlSinks = cpg.call
-  .name("(query|execute|raw|run)")
-  .where(_.argument.isCallTo(".*"))
-  .l
-
-val evalSinks = cpg.call.name("(eval|Function|exec|spawn|execFile)").l
-val xssSinks  = cpg.call.name("(innerHTML|outerHTML|write|writeln|insertAdjacentHTML|dangerouslySetInnerHTML)").l
-val osSinks   = cpg.call.name("(exec|spawn|execSync|spawnSync|execFile)").l
-val fsSinks   = cpg.call.name("(readFile|readFileSync|writeFile|writeFileSync|createReadStream|sendFile|render)").l
-val fetchSinks = cpg.call.name("(fetch|axios|got|request|http\\.get|https\\.get)").l
-val redirectSinks = cpg.call.name("(redirect|location\\.href|location\\.replace|router\\.push)").l
-
-val allSinks = (sqlSinks ++ evalSinks ++ xssSinks ++ osSinks ++ fsSinks ++ fetchSinks ++ redirectSinks).distinct
-
-// ── Trace taint paths ──────────────────────────────────────────────────
-val taintPaths = allSinks.flatMap { sink =>
-  val flows = sink.reachableByFlows(cpg.parameter.l ++ paramSources).l
-  flows.zipWithIndex.map { case (flow, i) =>
-    val steps = flow.elements.map { node =>
-      s"""{"file":"${node.file.name.headOption.getOrElse("?")}","line":${node.lineNumber.getOrElse(-1)},"code":"${node.code.replace("\"","\\\"").take(120)}"}"""
-    }.mkString("[", ",", "]")
-    val sinkType = sink.name match {
-      case n if sqlSinks.contains(sink)      => "sql_injection"
-      case n if evalSinks.contains(sink)     => "code_injection"
-      case n if xssSinks.contains(sink)      => "xss"
-      case n if osSinks.contains(sink)       => "command_injection"
-      case n if fsSinks.contains(sink)       => "path_traversal"
-      case n if fetchSinks.contains(sink)    => "ssrf"
-      case n if redirectSinks.contains(sink) => "open_redirect"
-      case _                                 => "unknown"
-    }
-    val sourceFile = flow.elements.head.file.name.headOption.getOrElse("?")
-    val sourceLine = flow.elements.head.lineNumber.getOrElse(-1)
-    val sinkFile   = sink.file.name.headOption.getOrElse("?")
-    val sinkLine   = sink.lineNumber.getOrElse(-1)
-    s"""{"source_file":"$sourceFile","source_line":$sourceLine,"sink_file":"$sinkFile","sink_line":$sinkLine,"sink_name":"${sink.name}","sink_type":"$sinkType","hop_count":${flow.elements.size},"steps":$steps}"""
-  }
-}
-
-// ── Call graph edges ───────────────────────────────────────────────────
-val callEdges = cpg.call
-  .where(_.callee.isDefined)
-  .map { c =>
-    val callerFile   = c.file.name.headOption.getOrElse("?")
-    val callerMethod = c.method.name
-    val callerLine   = c.lineNumber.getOrElse(-1)
-    val calleeFile   = c.callee.file.name.headOption.getOrElse("?")
-    val calleeMethod = c.callee.name
-    s"""{"caller_file":"$callerFile","caller_method":"$callerMethod","caller_line":$callerLine,"callee_file":"$calleeFile","callee_method":"$calleeMethod"}"""
-  }.distinct.l
-
-// ── Unreachable sinks (dead code / no caller path) ─────────────────────
-val reachableSinkFiles = taintPaths.map(p => p).toSet
-val unreachable = allSinks.filter { sink =>
-  sink.reachableByFlows(cpg.parameter.l).isEmpty
-}.map { sink =>
-  s"""{"file":"${sink.file.name.headOption.getOrElse("?")}","line":${sink.lineNumber.getOrElse(-1)},"sink_name":"${sink.name}"}"""
-}
-
-// ── Write output ───────────────────────────────────────────────────────
-val json = s"""{
-  "taint_paths": [${taintPaths.mkString(",\n  ")}],
-  "call_graph":  [${callEdges.take(2000).mkString(",\n  ")}],
-  "unreachable_sinks": [${unreachable.mkString(",\n  ")}],
-  "coverage": {
-    "methods_analyzed": ${cpg.method.l.size},
-    "calls_analyzed":   ${cpg.call.l.size},
-    "taint_paths_found": ${taintPaths.size},
-    "unreachable_sinks": ${unreachable.size}
-  }
-}"""
-
-new PrintWriter(outFile) { write(json); close() }
-println(s"CPG extracted: ${taintPaths.size} taint paths, ${callEdges.size} call edges")
-```
-
-If the Joern script exits non-zero, log the error but continue — write partial output if any paths were found.
-
----
-
-## Step 5 — Merge multi-language outputs (polyglot only)
-
-If multiple `cpg-paths-<language>.json` files were produced:
-1. Read all files
-2. Combine `taint_paths[]` arrays (deduplicate by `source_file + source_line + sink_file + sink_line`)
-3. Combine `call_graph[]` arrays (deduplicate by `caller_file + caller_method + callee_file + callee_method`)
-4. Combine `unreachable_sinks[]`
-5. Sum `coverage` fields
-
----
-
-## Step 6 — Write cpg-output.json
-
-Write to `--cpg-out` path (default: `./cpg-output.json`):
+## Output schema (cpg-output.json)
 
 ```json
 {
@@ -217,78 +49,31 @@ Write to `--cpg-out` path (default: `./cpg-output.json`):
   "repo_path": "<absolute repo path>",
   "generated_at": "<ISO 8601>",
   "languages_analyzed": ["typescript"],
-  "taint_paths": [
-    {
-      "source_file": "routes/login.ts",
-      "source_line": 12,
-      "sink_file": "routes/login.ts",
-      "sink_line": 34,
-      "sink_name": "query",
-      "sink_type": "sql_injection",
-      "hop_count": 1,
-      "steps": [
-        { "file": "routes/login.ts", "line": 12, "code": "req.body.email" },
-        { "file": "routes/login.ts", "line": 34, "code": "sequelize.query(`SELECT...${email}...`)" }
-      ]
-    }
+  "degraded": true,
+  "degraded_reason": "upstream Joern bug in jssrc2cpg.ObjectPropertyCallLinker ... blocks the post-processing passes reachableByFlows needs; confirmed on v4.0.583 and v4.0.579.",
+  "taint_paths": [],
+  "sinks_found": [
+    { "file": "routes/login.ts", "line": 34, "sink_name": "query", "sink_type": "sql_injection" }
   ],
   "call_graph": [
-    {
-      "caller_file": "routes/login.ts",
-      "caller_method": "router.post./login",
-      "caller_line": 10,
-      "callee_file": "lib/insecurity.ts",
-      "callee_method": "hash"
-    }
+    { "caller_file": "routes/login.ts", "caller_method": "router.post./login", "caller_line": 10,
+      "callee_file": "lib/insecurity.ts", "callee_method": "hash" }
   ],
-  "unreachable_sinks": [
-    { "file": "lib/legacy.ts", "line": 44, "sink_name": "eval" }
-  ],
-  "coverage": {
-    "methods_analyzed": 1250,
-    "calls_analyzed": 4800,
-    "taint_paths_found": 23,
-    "unreachable_sinks": 2
-  }
+  "unreachable_sinks": [],
+  "coverage": { "methods_analyzed": 1250, "calls_analyzed": 4800, "sinks_found": 23, "taint_paths_found": 0, "unreachable_sinks": 0 }
 }
 ```
 
----
+**Currently running in degraded mode** (see Constraints) — `taint_paths[]` and `unreachable_sinks[]` are always empty and `degraded: true` is set, because full interprocedural dataflow tracing (`reachableByFlows`) is blocked by an upstream Joern bug (see below). `sinks_found[]` is the replacement signal: real sink locations from the CPG (no hop-by-hop path, no source correlation), still useful for `find-vulns-*` to prioritize which files/lines to check. If a future Joern release fixes the underlying bug, `joern_extract.sc` can be reverted to use `reachableByFlows` for full taint-path tracing again — see the script's own header comment for exactly what to restore.
 
-## Step 7 — Print summary
-
-```
-joern-parse complete.
-  Repo              : <repo-path>
-  Languages parsed  : <list>
-  Taint paths found : <N>  (exhaustive — includes all graph-reachable paths)
-  Call graph edges  : <N>
-  Unreachable sinks : <N>  (dead code — find-vulns will skip these)
-  Output            : cpg-output.json
-
-  Top sink types:
-    sql_injection    : <N> paths
-    xss              : <N> paths
-    code_injection   : <N> paths
-    command_injection: <N> paths
-    ssrf             : <N> paths
-    open_redirect    : <N> paths
-
-  find-vulns skills will use these paths to:
-    (1) Prioritize which files to read first (highest-hit files)
-    (2) Pre-confirm paths without re-tracing each hop
-    (3) Reduce analysis time on already-mapped taint chains
-```
-
----
+`call_graph[]` is capped at 2000 edges. Polyglot repos: the script runs Joern once per distinct language flag and merges `taint_paths`/`call_graph`/`unreachable_sinks`/`sinks_found` (deduplicated) with summed `coverage`, matching the schema above exactly.
 
 ## Constraints
 
-- Do NOT read source files — Joern parses the repo. This skill only invokes Joern and processes its output.
-- If Joern is not installed, the pipeline continues in degraded mode — do not error or stop the full scan.
-- `call_graph[]` is capped at 2000 edges in the export to keep file sizes manageable. The full CPG database is retained on disk for interactive queries.
-- Joern CPG binary is NOT copied to `<out-dir>` (too large). Only `cpg-output.json` is preserved.
-- `unreachable_sinks` is informational — find-vulns still reads those files but deprioritizes them.
+- Do not re-run or hand-modify the Joern query — `harness/scripts/joern_extract.sc` is the single source of truth for the taint/call-graph extraction logic. If it needs to change, that's an edit to the checked-in script, not a per-run improvisation.
+- **Full taint-path tracing is disabled (degraded mode) — this is deliberate, not a bug to silently "fix" by re-adding `reachableByFlows` calls.** Real investigation (see script header comment and project history) found that Joern's own `loadCpg()` builtin (which routes through `Console.importCpg`) unconditionally runs a JS-frontend post-processing pass (`jssrc2cpg.ObjectPropertyCallLinker`) that crashes with `RuntimeException: Assignment statement with 3 arguments` on real-world TypeScript code — confirmed on the latest Joern release (v4.0.583) and an ~8-day-older release (v4.0.579), so it's a persistent upstream bug, not a version regression fixable by pinning elsewhere. The script works around it by loading the CPG via the lower-level `io.shiftleft.codepropertygraph.cpgloading.CpgLoader.load()` API instead, which skips that crashing pass — but the dataflow engine's own passes are part of the same post-processing stage, so `reachableByFlows` isn't usable in this mode. Do not attempt to re-enable it without first confirming upstream has actually fixed this crash.
+- Joern CPG binaries are NOT copied to `<out-dir>` (too large) — only `cpg-output.json` is preserved.
+- `unreachable_sinks` is always empty in degraded mode (computing it requires the same blocked dataflow engine) — this is not the same as "no unreachable sinks exist," it means the check wasn't run.
 
 ## Downstream consumers
 

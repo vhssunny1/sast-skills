@@ -4,6 +4,7 @@ from pathlib import Path
 # Paths — relative to the sast-skills repo root (one level up from harness/)
 ROOT_DIR   = Path(__file__).parent.parent
 SKILLS_DIR = ROOT_DIR / ".claude" / "commands"
+SCRIPTS_DIR = ROOT_DIR / "harness" / "scripts"  # deterministic (non-LLM) step scripts
 REPOS_DIR  = ROOT_DIR / "sast-repos"    # cloned target repos live here
 RUNS_DIR   = ROOT_DIR / "sast-runs"     # run artifacts live here
 

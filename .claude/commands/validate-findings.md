@@ -56,6 +56,11 @@ Subtract points for conditions that increase confidence:
 | `confidence_after_trace` ≥ 0.90 | -0.20 |
 | `taint_path` has ≥ 2 steps (cross-file verified) | -0.10 |
 | Severity is Critical and CWE maps to well-known injection class | -0.10 |
+| `codeql_confirmed: true` (set by `/codeql-scan` when its independent dataflow engine hit the same sink) | -0.25 |
+| `cpg_guided: true` and `cpg_source_confirmed: true` (Joern traced the full source→sink flow, not just a sink location) | -0.15 |
+| `cpg_guided: true` and `cpg_source_confirmed: false` (Joern confirmed only the sink location — weaker signal, source still LLM-only) | -0.05 |
+
+These three were documented in `CLAUDE.md`'s skill contracts as scoring inputs but were missing from this table (a real doc/implementation gap, not a design choice) — if you're adding a new upstream field that's meant to influence `fp_score`, add it here explicitly rather than assuming it's picked up automatically.
 
 ### Deployment context adjustment (config findings only)
 
@@ -110,6 +115,8 @@ Overwrite `findings.json` with the validated version. Add these fields to each f
 - `fp_score` — the computed false positive score
 - `validation_status` — one of: `confirmed`, `likely_real`, `needs_review`, `likely_fp`
 - `validation_notes` — array of strings explaining the score (e.g. "taint_confirmed: false adds 0.60", "cross-file path verified subtracts 0.10")
+
+Preserve `cpg_guided`, `cpg_source_confirmed`, and `codeql_confirmed` on every finding that has them (set by `find-vulns-*`/`codeql-scan`) — `scan-report` reads these into SARIF `result.properties`. Do not drop them just because this step doesn't otherwise reference the finding's other fields.
 
 Add a top-level `validation_summary`:
 

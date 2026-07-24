@@ -41,11 +41,24 @@ If `run-log.json` is present, extract `step_timings` — one entry per step in `
   "findings_after": <integer or null>,
   "findings_delta": <findings_after - findings_before, or null>,
   "error": null | "<message>",
-  "notes": { <forwarded verbatim from run-log step entry> }
+  "notes": { <forwarded verbatim from run-log step entry> },
+  "usage": { <forwarded verbatim from run-log step entry, or null if absent> }
 }
 ```
 
 Compute `findings_delta = findings_after - findings_before` for each step where both are non-null. This shows which step introduced the most findings (find-vulns) and which reduced them (validate-findings suppressing FPs).
+
+### Token usage & cost (from run-log.json)
+
+If a step entry has a `usage` object (added by the harness CLI/API path — not present when a step ran through `/sast-full-scan` as a slash command, since that path has no access to the underlying CLI's JSON envelope), forward it verbatim per-step, and also sum a run-level total:
+
+```
+token_usage_totals = run-log.json's own top-level "token_usage_totals" field if present,
+                     otherwise sum each step's usage.{input_tokens, output_tokens,
+                     cache_creation_input_tokens, cache_read_input_tokens, cost_usd}
+```
+
+If no step in `run-log.json` has a `usage` field, set `token_usage_totals: null` in the metrics record rather than a zeroed object — null means "not tracked for this run," zero would wrongly imply a free run.
 
 ### Finding pipeline attrition
 
@@ -150,9 +163,11 @@ Compare current run against the previous run for the same repo:
         "findings_after": null,
         "findings_delta": null,
         "error": null,
-        "notes": {}
+        "notes": {},
+        "usage": null
       }
-    ]
+    ],
+    "token_usage_totals": null
   },
   "pipeline": {
     "raw_findings": 0,
@@ -235,6 +250,11 @@ scan-metrics complete.
     <step-name>  : <Ns> — <findings_delta> findings (<status>)
     ...
     (omit if run-log.json absent)
+
+  Token usage & cost (from run-log.json, harness CLI/API runs only):
+    Total cost      : $<N> (or "not tracked" if no step has a usage field)
+    Input tokens    : <N> (incl. cache read/write)
+    Output tokens   : <N>
 
   Trends vs previous run:
     Finding delta     : <+N/-N> (or "first run")

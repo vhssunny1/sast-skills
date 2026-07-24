@@ -22,20 +22,22 @@ Check if `cpg-output.json` exists in the current directory.
 
 **If `cpg-output.json` is absent or has `"available": false`:** skip this step silently. Proceed with standard LLM discovery (existing behavior).
 
-**If `"available": true`:** load the CPG and apply the following:
+**If `"available": true`:** load the CPG and apply the following. Check for a `"degraded": true` field first — if present, `taint_paths[]` and `unreachable_sinks[]` will always be empty (a known, documented upstream Joern limitation, not a bug — see `harness/scripts/joern_extract.sc`'s header comment). In degraded mode, `sinks_found[]` is the populated signal to use instead; the steps below handle both cases without any special branching on your part — just use whichever arrays are actually non-empty.
 
 ### 1.5a — Build a CPG-priority file list
 
-From `cpg-output.json`, extract `taint_paths[]`. For each path, collect `source_file` and `sink_file`. Count how many taint paths involve each file.
+From `cpg-output.json`, build a per-file hit count from **both** signals, since either may be populated depending on whether the run is degraded:
+- From `taint_paths[]` (if non-empty): collect `source_file` and `sink_file` from each path.
+- From `sinks_found[]` (if non-empty): collect `file` from each entry. This is a sink *location* with no traced source — still real, CPG-confirmed signal, just without hop-by-hop path data.
 
-Build a map: `{ "<file-path>": <taint_path_count> }`. Files with more CPG-confirmed taint paths score higher.
+Build a map: `{ "<file-path>": <combined_hit_count> }`. Files with more CPG-confirmed hits (either kind) score higher.
 
 **Boost `security_priority`** for each file in `crawl-output.json` that appears in this map:
-- `taint_path_count` ≥ 5 → set `security_priority` to max(existing, 5)
-- `taint_path_count` 2–4 → set `security_priority` to max(existing, 4)
-- `taint_path_count` 1 → set `security_priority` to max(existing, 3)
+- `hit_count` ≥ 5 → set `security_priority` to max(existing, 5)
+- `hit_count` 2–4 → set `security_priority` to max(existing, 4)
+- `hit_count` 1 → set `security_priority` to max(existing, 3)
 
-This re-ordering ensures files with CPG-confirmed taint paths are analyzed first in Step 2's scan queue.
+This re-ordering ensures files with CPG-confirmed hits are analyzed first in Step 2's scan queue.
 
 ### 1.5b — Load call graph for cross-file tracing
 
@@ -45,29 +47,35 @@ During analysis in Step 4, when you need to find callers of a dangerous function
 
 ### 1.5c — Pre-populate CPG-confirmed candidate findings
 
-For each entry in `taint_paths[]`:
+For each entry in `taint_paths[]` (full traced source→sink flow, when present):
 - Create a **pre-candidate finding** with:
   - `cpg_path_id` — index in `taint_paths[]`
   - `source_file`, `source_line`, `sink_file`, `sink_line`, `sink_type`
   - `hop_count`, `steps[]` from the CPG path
-  - `cpg_guided: true` — marks this as a CPG-originated candidate
+  - `cpg_guided: true`, `cpg_source_confirmed: true` — marks this as a fully CPG-traced candidate
 
-Store these as `CPG_CANDIDATES`. Do NOT add them to `findings.json` yet — they become findings only after LLM semantic confirmation in Step 4.
+For each entry in `sinks_found[]` **not already covered** by a `taint_paths[]` entry at the same file+line (this is the primary signal in degraded mode — no traced source, just a confirmed sink location):
+- Create a lighter **pre-candidate finding** with:
+  - `sink_file`, `sink_line`, `sink_type` (`sink_name` too, for reference)
+  - `cpg_guided: true`, `cpg_source_confirmed: false` — marks this as sink-only CPG signal; you must still find and confirm the source yourself, same as standard discovery
+
+Store both kinds as `CPG_CANDIDATES`. Do NOT add them to `findings.json` yet — they become findings only after LLM semantic confirmation in Step 4. Preserve `cpg_guided` (and `cpg_source_confirmed`) on the finding all the way through to `findings.json` in Step 6 — downstream skills (`validate-findings`, `scan-report`) read it.
 
 ### 1.5d — Mark unreachable sinks
 
-From `cpg-output.json`, load `unreachable_sinks[]`. For any file in this list that also appears in the scan queue, annotate it:
+From `cpg-output.json`, load `unreachable_sinks[]` (always empty in degraded mode — nothing to do in that case). For any file in this list that also appears in the scan queue, annotate it:
 - Still read the file (CPG unreachability has false negatives for dynamic dispatch)
 - Mark findings from that file with `"cpg_reachable": false` — validate-findings will weigh this in `fp_score`
 
 Print:
 ```
-  CPG taint hints loaded:
+  CPG taint hints loaded: (degraded: <true/false>)
     Taint paths        : <N>
+    Sinks found        : <N>
     Call graph edges   : <N>
     Unreachable sinks  : <N> (will still be analyzed, deprioritized)
     Files re-prioritized: <N> files boosted by CPG hit count
-    CPG candidates     : <N> pre-mapped source→sink paths to confirm
+    CPG candidates     : <N> pre-mapped candidates to confirm (<N> full traced, <N> sink-only)
 ```
 
 ---

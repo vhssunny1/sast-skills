@@ -196,6 +196,7 @@
                 onclick="cancelScan()">Cancel</button>
       </div>
       <div id="step-list"></div>
+      <div id="warnings-panel" style="display:none;padding:.6rem 1.5rem;border-top:1px solid var(--border)"></div>
       <div id="results-panel" style="display:none"></div>
     </div>
   </main>
@@ -317,6 +318,9 @@ let stepEls = {};
 function clearProgress() {
   document.getElementById('step-list').innerHTML = '';
   document.getElementById('results-panel').style.display = 'none';
+  const warnings = document.getElementById('warnings-panel');
+  warnings.innerHTML = '';
+  warnings.style.display = 'none';
   stepEls = {};
 }
 
@@ -408,6 +412,15 @@ function handleEvent(ev) {
     case 'step_skipped':
       setStepState(ev.step, 'skipped', ev.reason || '');
       break;
+    case 'warning': {
+      const panel = document.getElementById('warnings-panel');
+      panel.style.display = '';
+      const line = document.createElement('div');
+      line.style.cssText = 'font-size:.78rem;color:var(--warning);margin-top:.3rem';
+      line.textContent = '⚠ ' + ev.message;
+      panel.appendChild(line);
+      break;
+    }
     case 'step_error':
     case 'fatal_error': {
       const timing = ev.duration_seconds != null ? ` (${fmtDuration(ev.duration_seconds)})` : '';
@@ -476,6 +489,16 @@ async function viewRun(run_id) {
     } else detail = '';
     setStepState(s.step, state, detail);
   });
+  if (log.warnings?.length) {
+    const panel = document.getElementById('warnings-panel');
+    panel.style.display = '';
+    log.warnings.forEach(w => {
+      const line = document.createElement('div');
+      line.style.cssText = 'font-size:.78rem;color:var(--warning);margin-top:.3rem';
+      line.textContent = '⚠ ' + w.message;
+      panel.appendChild(line);
+    });
+  }
   if (log.status === 'success') showResults(run_id);
 }
 

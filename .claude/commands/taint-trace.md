@@ -4,16 +4,18 @@ This agent operates AFTER find-vulns. It does NOT re-scan for new vulnerabilitie
 
 ## Input
 
-`$ARGUMENTS` format: `[--findings <path>] [--crawl <path>]`
+`$ARGUMENTS` format: `[--findings <path>] [--crawl <path>] [--cpg <path>]`
 
 - `--findings <path>` — path to `findings.json` (default: `./findings.json`)
 - `--crawl <path>` — path to `crawl-output.json` (default: `./crawl-output.json`)
+- `--cpg <path>` — path to `cpg-output.json` (default: `./cpg-output.json`, if it exists)
 
 ## Step 1 — Load inputs
 
-Read both files:
+Read:
 - `findings.json` — the candidate findings from find-vulns
 - `crawl-output.json` — the file map (roles, entry points, routes)
+- `cpg-output.json`, **if it exists and has `"available": true`** — a real call graph Joern already built from the actual code, for free. Loading this here is not optional busywork: without it, Step 3 has you re-derive the same caller/callee relationships by reading every entry-point file by hand, which is pure duplicated cost when the CPG already has the answer.
 
 Extract from crawl-output.json:
 - `repo_path` — needed to read source files
@@ -21,7 +23,9 @@ Extract from crawl-output.json:
 - `entry_points[]` — controllers and their routes, used as taint entry nodes
 - `framework` — affects how user input enters the app
 
-If either file is missing, print an error and stop.
+If `cpg-output.json` is present and available, extract `call_graph[]` and store it as `CPG_CALL_GRAPH` (a map of `callee_file + callee_method → [callers]`) — this is what Step 3 will check before falling back to manual reconstruction.
+
+If `findings.json` or `crawl-output.json` is missing, print an error and stop. A missing/unavailable `cpg-output.json` is not an error — proceed to Step 3's manual fallback.
 
 ## Step 2 — Understand what you are doing
 
@@ -94,7 +98,12 @@ Taint travels FORWARD (source → sink). You trace it BACKWARD (sink → source)
 
 ## Step 3 — Build a lightweight call graph
 
-Before tracing individual findings, build a mental model of the codebase's call structure by reading the entry_point files.
+**If `CPG_CALL_GRAPH` was loaded in Step 1, use it first.** For each entry_point, check whether its callees already appear in `CPG_CALL_GRAPH` (keyed by `callee_file + callee_method`). Joern already resolved these caller/callee relationships from the actual parsed code — building the same map by re-reading every entry-point file by hand is redundant work with real token cost, not a more-thorough alternative. Only fall back to reading a file directly when:
+- `cpg-output.json` was absent/unavailable for this run, or
+- an entry_point's specific callee isn't covered in `CPG_CALL_GRAPH` (Joern's call-graph edges can be incomplete for dynamic dispatch, decorators, or framework magic — this is a real gap, not a shortcut to skip), or
+- you need to verify a specific taint-propagation detail (a sanitizer call, a parameter shape) that the call graph's caller/callee pairing alone doesn't tell you.
+
+When falling back (whether entirely, because CPG data is unavailable, or for specific gaps CPG_CALL_GRAPH didn't cover), build the mental model by reading the entry_point files directly:
 
 For each entry_point in `crawl-output.json`:
 1. Read the file

@@ -119,10 +119,15 @@ Write `scan-results.sarif` (JSON, SARIF 2.1.0 format).
     "validation_status": "<validation_status>",
     "source": "<source field>",
     "sink": "<sink field>",
-    "fix_hint": "<fix_hint field>"
+    "fix_hint": "<fix_hint field>",
+    "cpg_guided": "<cpg_guided field, if set — omit the key entirely if the finding has no cpg_guided field>",
+    "cpg_source_confirmed": "<cpg_source_confirmed field, if set — omit if absent>",
+    "codeql_confirmed": "<codeql_confirmed field, if set — omit if absent>"
   }
 }
 ```
+
+`cpg_guided`/`cpg_source_confirmed`/`codeql_confirmed` are set upstream (by `find-vulns-*` and `codeql-scan` respectively) and must survive unchanged through `validate-findings` — this was previously documented in `CLAUDE.md` as part of the SARIF output but missing from this template (a real gap, not a design choice). Only include each key when the finding actually has that field; don't write `null`/`false` placeholders for findings that were never CPG- or CodeQL-processed.
 
 SARIF level mapping:
 - `critical` → `"error"`

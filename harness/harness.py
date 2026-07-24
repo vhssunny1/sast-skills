@@ -59,6 +59,7 @@ class ScanRequest(BaseModel):
     dast: bool = False
     fresh: bool = False
     resume_run_id: Optional[str] = None
+    recheck_tier5: bool = False
 
 
 def _resolve_repo(source: str) -> Path:
@@ -66,6 +67,10 @@ def _resolve_repo(source: str) -> Path:
     Accept either a local folder path or a GitHub/git URL.
     - Local path: must exist as a directory, used directly.
     - URL (http/https/git@): cloned into REPOS_DIR (pulled if already cloned).
+    KEEP IN SYNC with cli.py's _resolve_repo — duplicated (not imported) so
+    the CLI stays free of a FastAPI/uvicorn/auth dependency. These drifted
+    apart once already (different clone depth, pull flags, missing timeout
+    on the CLI side) — check both whenever you change either.
     """
     # Detect local path: exists on disk, or starts with drive letter / UNC / Unix root
     local = Path(source)
@@ -125,6 +130,7 @@ async def start_scan(req: ScanRequest):
                 dast=req.dast,
                 fresh=req.fresh,
                 resume_run_id=req.resume_run_id,
+                recheck_tier5=req.recheck_tier5,
             )
         except asyncio.CancelledError:
             pass
