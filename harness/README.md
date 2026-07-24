@@ -18,10 +18,7 @@ python3 cli.py <repo-path-or-git-url>
 python3 cli.py <repo-path-or-git-url> --skip-joern --dast
 ```
 
-See `python3 cli.py --help` for the full flag list (mirrors the web UI's scan options), and
-[../docs/LINUX-DEPLOYMENT.md](../docs/LINUX-DEPLOYMENT.md) for a complete fresh-VPS setup
-walkthrough (Node/tree-sitter/Joern/claude CLI installation and the real gotchas hit getting
-each one working headlessly).
+See `python3 cli.py --help` for the full flag list (mirrors the web UI's scan options).
 
 ---
 

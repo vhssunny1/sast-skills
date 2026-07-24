@@ -323,27 +323,6 @@ Every full scan writes to `sast-runs/<timestamp>/`:
 
 ---
 
-## Recent Changes
-
-| Feature | What changed |
-|---|---|
-| **Joern CPG pre-analysis** | `/joern-parse` runs automatically before Group 1 if Joern is installed. Exports all graph-reachable taint paths to `cpg-output.json`. find-vulns skills load this in Step 1.5 to boost file priorities, pre-confirm taint candidates, and use the call graph for caller resolution — catching second-order flows and deep chains the LLM alone would miss. |
-| **CodeQL second-signal** | Optional `/codeql-scan` runs in Group 2 (parallel with find-vulns, no wall-time cost). Confirms LLM findings (−0.25 fp_score) and surfaces `CQL-*` findings for paths both Joern and LLM missed. Activate with `--codeql`. |
-| **Graph-guided find-vulns** | All three find-vulns skills (TypeScript, Python, Java) now include Step 1.5: CPG taint hint loading, file priority boosting, CPG candidate pre-population, and Step 4b CPG candidate confirmation. Findings track `cpg_guided` and `llm_discovered` counts. |
-| **tree-sitter fast pre-crawl** | `/crawl-tree-sitter` runs before Group 1 (auto-detected). Mechanical AST scan is faster than an LLM crawl and supersedes it when available; falls back gracefully to the standard `crawl-*` skills otherwise. |
-| **Coverage-completeness batching** | `find-vulns-*` now splits each language's `security_priority ≥ 2` file list into fixed-size batches (40 files) and invokes the skill once per batch. Fixes a real regression where a single agent turn asked to exhaustively read 200+ files was self-truncating (observed: 27/232 required files actually read in one run) — every required file is now guaranteed a read pass. |
-| **CONFIG findings no longer lost** | `find-vulns-*` skills hardcode "overwrite `findings.json`" in their own instructions, which was silently deleting all `config-audit` findings on every scan. The harness now explicitly preserves and re-merges `CONFIG-*` findings after find-vulns runs, for both single-language and polyglot repos (the previous polyglot merge path was also broken — it read a filename the skills never actually wrote). |
-| **Consistent `security_priority` rubric across languages** | `crawl-typescript` and `crawl-java` previously had no documented scoring rubric (unlike Python) — the model was improvising priority scores with no repeatable criteria. Both now have an explicit 1–5 table aligned to their `find-vulns-*` sink patterns, matching Python's format. |
-| **Web harness accepts local paths** | `harness/harness.py` now resolves local folder paths in addition to GitHub URLs. Pass `/path/to/local-repo` or `https://github.com/...` interchangeably. |
-| **SKILL_TIMEOUT extended** | `harness/agent.py` raises `SKILL_TIMEOUT` to 7200s (2 hours) to accommodate large repos (400+ file TypeScript scans that previously timed out). |
-| **Scan cancel/delete actually stop the pipeline** | Previously "Cancel"/"Delete" in the web UI only detached the SSE stream — the background pipeline task (and its in-flight `claude` subprocess) kept running invisibly. Both now properly cancel the task and kill the subprocess. A history item can also be permanently deleted (new trash icon per scan, plus a "Clear all" control), separate from cancelling an active run. |
-| **Per-step timing + findings metrics in the UI** | Each pipeline step now reports its own duration and findings delta, shown live as the scan runs and when reviewing scan history — not just a final total. |
-| **CVSS 3.1 numeric scoring** | All `find-vulns-*` and `config-audit` skills output `cvss_vector` and `cvss_score` per finding. `validate-findings` sorts within severity bands by `cvss_score` DESC. `scan-report` emits both fields in SARIF and Markdown. |
-| **Structured scan run logs** | `sast-full-scan` writes `run-log.json` per run — one entry per pipeline step with timing, findings delta, and error capture. `scan-metrics` reads it for per-step trend analysis. |
-| **Parallel skill execution** | Group 1 (crawl + config-audit) runs concurrently. In Group 2, `find-vulns-*` now runs sequentially per language (required — they share one output file), while `codeql-scan` runs concurrently alongside that chain. |
-
----
-
 ## Why Graph Tools + LLM
 
 Traditional SAST tools use one approach or the other:
@@ -382,8 +361,3 @@ The key insight: Joern guarantees **recall** (no missed paths). The LLM guarante
 - **Optional:** [Joern](https://docs.joern.io/installation) — for CPG pre-analysis (auto-detected)
 - **Optional:** [CodeQL CLI](https://github.com/github/codeql-cli-binaries/releases) — for second-signal confirmation (`--codeql` flag)
 - **Optional:** [tree-sitter CLI](https://github.com/tree-sitter/tree-sitter/blob/master/cli/README.md) — for the fast mechanical pre-crawl (auto-detected). On Windows, grammar compilation requires a C compiler with Windows SDK headers (e.g. Visual Studio Build Tools) — without one, tree-sitter falls back gracefully to the standard LLM crawl.
-
-**Deploying on a fresh Linux box / VPS?** See [docs/LINUX-DEPLOYMENT.md](docs/LINUX-DEPLOYMENT.md)
-for a complete step-by-step walkthrough (Node/tree-sitter/Joern/claude CLI install, a headless
-CLI runner with no web server, and the real gotchas hit setting this up from scratch — glibc
-version mismatches, permission/sandbox trust, etc.).
