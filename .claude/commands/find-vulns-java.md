@@ -170,6 +170,24 @@ Scan for methods named `sanitize*`, `validate*`, `guard*`, `check*`, `filter*`, 
 
 Flag at medium severity. Fix: always cap allocations with `Math.min(userSize, MAX_ALLOWED_BYTES)` and never compile user-supplied strings as `Pattern`.
 
+**Q9 — Mass assignment:** Does a controller bind a full request body directly onto a JPA entity with no field allowlist? Look for `@ModelAttribute Entity entity` bound straight to a `repository.save(entity)` call, `BeanUtils.copyProperties(requestDto, entity)` copying every field including ones the client should never set (`id`, `role`, `isAdmin`, `balance`), or a `@RequestBody` DTO that is the same class as the persisted entity (no separate DTO/allowlist layer). Confirm the entity/DTO doesn't already exclude sensitive fields (`@JsonIgnore`, a distinct create-DTO without those fields) before flagging. CWE-915, high severity when the writable field set includes anything privilege-related.
+
+**Q10 — CSRF protection absent:** In Spring Security configuration (`SecurityConfig`, `WebSecurityConfigurerAdapter`, or a `SecurityFilterChain` bean), is CSRF explicitly disabled via `.csrf().disable()` or `.csrf(csrf -> csrf.disable())` while the app still authenticates via session cookie (not exclusively stateless JWT-bearer)? Flag as CWE-352, medium-high severity depending on what state-changing endpoints exist.
+
+**Don't be fooled by a nearby origin/referer check that doesn't gate anything:** some handlers read an `Origin`/`Referer` request header right next to the sensitive write and it can look like protection at a glance. Verify the check's result is actually used in a conditional that returns/throws when it fails. If the boolean is instead passed to unrelated bookkeeping (a metrics call, an internal tracker) and the write below it runs unconditionally regardless of that boolean's value, there is no real protection — flag it exactly as if no check existed. Read the full surrounding method; do not stop at "a check mentioning origin/referer exists somewhere in this handler."
+
+**Q11 — Cookie and security-header hardening:** This check requires an explicit search, not incidental noticing — a file can get read for an unrelated finding (a hardcoded key, a weak hash) and a cookie construction nearby is easy to skip past. As a discrete sub-step, search the whole codebase for every `new Cookie(...)`/`ResponseCookie.from(...)` call site, not just files already flagged for other reasons. For each: is it setting a session/auth token? If so and `.setSecure(true)`/`.secure(true)` or `.setHttpOnly(true)`/`.httpOnly(true)` is omitted — including a construction with no such calls at all — flag as CWE-614.
+
+Separately, check the Spring Security config for which of these specific header protections are actually configured: `frameOptions`, `contentSecurityPolicy`, `httpStrictTransportSecurity`, `contentTypeOptions`. This is a per-header check, not all-or-nothing — a config can enable frame options while leaving CSP and HSTS entirely unconfigured. Flag CWE-693 medium severity per specific header class that is absent, noting exactly which are covered vs missing.
+
+**Q12 — Weak cryptography and randomness (beyond Q3's password-hash check):** Is `MessageDigest.getInstance("MD5")`/`"SHA1"` used for a token, signature, or integrity check rather than a non-security checksum — flag as CWE-327. Is `new Random()` (not `SecureRandom`) used to generate a session id, password-reset token, or API key — flag as CWE-330. Is a key passed to `new SecretKeySpec(...)` or `Cipher.getInstance(...)` a string literal in source rather than loaded from a keystore/env/secret manager — flag as CWE-321.
+
+**Q13 — Timing side-channels and user enumeration:** In a login or password-reset controller, does the response (status, message, or exception type) differ depending on whether the *account* exists vs. whether the *password* is wrong (e.g. `UsernameNotFoundException` surfaced distinctly from `BadCredentialsException` in the response body)? Both cases should return an identical generic response — flag as CWE-204/CWE-208. Separately, is a secret/token compared with `.equals()` instead of `MessageDigest.isEqual()` — flag as CWE-208 at medium severity.
+
+**Q14 — Password policy and re-authentication on change:** Does the registration/password-set endpoint accept any non-empty string with no `@Size`/`@Pattern` validation or equivalent complexity check? Flag as CWE-521 medium severity (registration-time policy, distinct from CWE-916's hash-strength check). **Check both places this validation could live, not just the controller:** the JPA entity itself may define the password field with no `@Size`/`@Pattern` constraint even if the controller's DTO also lacks one — a custom setter or `@PrePersist` hook that hashes the value but applies no length/complexity check is just as much a missing-policy finding. If the controller passes the raw password straight to `repository.save()` with no validation on either side, check the entity class before concluding whether policy exists. Does a password-change endpoint update the password without first verifying the current password or re-authenticating? Flag as CWE-620 high severity.
+
+**Q15 — Sensitive data at rest and in URL:** Does a JPA entity field meant to hold sensitive data (SSN, credit card, raw password, private API key) get persisted with no encryption/hash transform applied before `repository.save()` — flag as CWE-312. Separately, does a password, session token, or reset token appear as a `@RequestParam`/`@PathVariable` on a `GET` mapping rather than in a request body or `Authorization` header — flag as CWE-598; query strings land in access logs, browser history, and `Referer` headers.
+
 ---
 
 ## Step 5 — Analyze JSP/JSPX files
@@ -224,6 +242,18 @@ Read `struts.xml`, `web.xml`, `applicationContext.xml`. Look for:
 | Dev/debug mode exposed | CWE-209 | A05:2021 |
 | Insecure deserialization | CWE-502 | A08:2021 |
 | Missing auth for critical function | CWE-306 | A07:2021 |
+| Mass assignment (unrestricted field write) | CWE-915 | A08:2021 |
+| CSRF protection absent | CWE-352 | A01:2021 |
+| Cookie missing Secure/HttpOnly | CWE-614 | A05:2021 |
+| Missing security headers | CWE-693 | A05:2021 |
+| Weak crypto algorithm (MD5/SHA1 for tokens) | CWE-327 | A02:2021 |
+| Insufficiently random token (java.util.Random) | CWE-330 | A02:2021 |
+| Hardcoded server-side crypto key | CWE-321 | A02:2021 |
+| Timing side-channel / user enumeration | CWE-204 | A07:2021 |
+| Weak password requirements | CWE-521 | A07:2021 |
+| Unverified password change | CWE-620 | A07:2021 |
+| Cleartext storage of sensitive data | CWE-312 | A02:2021 |
+| Sensitive data in query parameters | CWE-598 | A01:2021 |
 
 **CVSS 3.1 scoring** — For every finding, assign `cvss_vector` and `cvss_score`.
 
@@ -262,6 +292,15 @@ Use the reference table below to pick a starting vector, then adjust for the spe
 | Sensitive data in logs | CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N | 5.5 |
 | Dev/debug mode exposed | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N | 5.3 |
 | Information leakage — error messages | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N | 5.3 |
+| Mass assignment — privilege field writable | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N | 7.7 |
+| CSRF — state-changing endpoint, session auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:N | 6.5 |
+| Cookie missing Secure/HttpOnly flag | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N | 4.3 |
+| Missing security headers | CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N | 4.7 |
+| Weak crypto / predictable token (java.util.Random) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N | 6.5 |
+| Timing side-channel / user enumeration | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N | 5.3 |
+| Weak password requirements | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N | 4.0 |
+| Unverified password change | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N | 6.8 |
+| Cleartext storage of sensitive data | CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:N/A:N | 5.5 |
 
 Adjustment examples:
 - Exploit requires admin access → PR:L → PR:H (score drops ~0.5–2.0)

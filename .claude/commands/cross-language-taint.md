@@ -92,6 +92,48 @@ This is a **multi-hop prompt injection** path. Key differences from single-hop L
 
 Include a `role: "rag_retrieval"` step in `taint_path` for the vector store hop, in addition to `role: "llm_transformation"` for the LLM step.
 
+### LLM output to filesystem write
+
+```
+Attacker-influenced content enters LLM context (chat message, RAG-retrieved chunk, uploaded document)
+    ↓  [LLM API call — .choices[0].message.content / response.text / stream chunks]
+LLM generates a response the attacker partially or fully controls (via prompt injection)
+    ↓  [Python backend — writes LLM output to disk]
+open(path, 'w') / os.path.join(llm_output, ...) / shutil.copy using LLM-generated content as a filename or file content
+```
+
+This is a distinct chain from the stored-XSS path above — the sink here is a filesystem write, not a render. Two exploitation shapes:
+- **Filename control:** the LLM's response text is used to construct a file path (e.g. "save this as `<LLM-suggested-name>`") — a prompt-injected LLM response containing `../../` or an absolute path can write outside the intended directory
+- **Content control:** the LLM's response text is written verbatim as file content that is later read by a config loader, executed as code, or parsed as a trusted format — an adversarial LLM response becomes attacker-controlled file content on the next read
+
+**When to create this finding:** (1) confirmed LLM API call whose output is reachable by adversarial influence (chat input, RAG retrieval, any prompt-injectable source), AND (2) that output (or a value derived from it) is passed to a file-write sink (`open(..., 'w')`, `Path.write_text`, `os.path.join` feeding a write, `shutil.copy`/`move`) with no path-containment check or content validation.
+
+**Confidence:** 0.60–0.75 (the code path is confirmed; whether the LLM can be steered to produce a specific malicious path/content is probabilistic but well-documented in practice). Use `role: "llm_filesystem_write"` for the write-sink step in `taint_path`.
+
+### LLM output to async task queue
+
+```
+Attacker-influenced content enters LLM context
+    ↓  [LLM API call]
+LLM generates a response the attacker partially or fully controls
+    ↓  [Python backend — enqueues LLM output as a task argument]
+celery_task.delay(llm_output) / task.apply_async(args=[llm_output])
+    ↓  [Async worker — task executes later, in a different process]
+Task body uses the argument in a shell command, eval, DB query, or other dangerous sink
+```
+
+This crosses both a language-agnostic trust boundary (LLM output treated as safe task input) and a process boundary (the async worker), compounding the risk the same way the existing async-queue taint model does for ordinary HTTP-sourced taint — except here the "source" is LLM-generated text, not direct user input, so the injection is one hop further removed and easy to miss if cross-language-taint only looks at HTTP-originated sources.
+
+**When to create this finding:** (1) confirmed LLM API call reachable by adversarial influence, AND (2) its output (or a value derived from it) is passed as a Celery/RQ/Dramatiq task argument, AND (3) the task body uses that argument in a dangerous sink (shell command, `eval`, SQL, file path) without validation.
+
+**Confidence:** 0.55–0.70 (one more hop of indirection than the direct filesystem-write chain above — both "the LLM can be steered to emit the payload" and "the task body doesn't validate its argument" must hold). Use `role: "llm_celery_injection"` for the enqueue step in `taint_path`.
+
+### Extending the existing RAG chain further
+
+The RAG multi-hop chain above should also be checked for these two additional downstream shapes, which use the same detection method (trace from vector-store retrieval to final sink) but end somewhere other than a direct HTML render:
+- LLM output rendered via a server-side template engine (Jinja2, FastAPI `HTMLResponse` built from a template string) — server-side template injection, not just client-side XSS
+- LLM output used as the system prompt for a second, downstream LLM call — prompt injection amplification, where the first LLM's (attacker-influenced) output becomes trusted instruction context for a second model
+
 ### Standalone prompt injection — no render sink required
 
 The two finding classes above (stored-XSS via language boundary, LLM taint → stored XSS) require a frontend render sink to complete the path. But prompt injection is exploitable **without** a downstream HTML render — the LLM can be instructed to exfiltrate data, skip safety checks, produce incorrect outputs, or trigger backend actions regardless of whether its output reaches `innerHTML`.

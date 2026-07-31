@@ -649,7 +649,28 @@ def classify_role(facts: FileFacts, path: str) -> str:
     return "util"
 
 
-def compute_priority(facts: FileFacts) -> int:
+_UTILITY_SEGMENT_PATTERN = re.compile(
+    r"^(.*_util|.*_helper|.*_manager|.*_extractor|.*_tool|utils?|helpers?|managers?|extractors?|tools?)$",
+    re.IGNORECASE,
+)
+
+
+def _is_utility_path(path: str) -> bool:
+    """True if any directory segment or the filename stem matches a
+    utility/helper/manager/extractor/tool naming convention — checked
+    per-segment (not a single filename-suffix regex) so a path like
+    `ls_manager/downloaders.py` matches on its directory name even though
+    the filename itself ("downloaders") doesn't match any pattern alone."""
+    norm = path.replace("\\", "/")
+    parts = [p for p in norm.split("/") if p]
+    if not parts:
+        return False
+    stem = Path(parts[-1]).stem
+    candidates = parts[:-1] + [stem]
+    return any(_UTILITY_SEGMENT_PATTERN.match(seg) for seg in candidates)
+
+
+def compute_priority(facts: FileFacts, path: str = "") -> int:
     tier5_types = {"eval", "sql_injection", "sql_template_literal", "xss_innerHTML",
                    "xss_dangerouslySetInnerHTML", "command_injection", "deserialization"}
     tier4_types = {"ssrf", "path_traversal", "jwt_sign", "weak_hash"}
@@ -661,6 +682,22 @@ def compute_priority(facts: FileFacts) -> int:
         return 4
     if facts.user_input_sources or facts.has_interaction_handlers:
         return 3
+
+    # A utility/manager/extractor/helper/tool-named file with real function
+    # logic can process attacker-controlled data (a file path, bytes, a
+    # user-uploaded video) passed in as a plain function parameter rather
+    # than read directly from req.*/request.* — our own dangerous-pattern
+    # and user-input-source detection above only recognizes the latter, so
+    # such a file scores 1 and is silently excluded from the find-vulns scan
+    # queue (which only includes security_priority >= 2) even when it's
+    # reachable with real attacker-controlled input from an entry point
+    # elsewhere. Confirmed gap during a gap-analysis review — floor these at
+    # 2 (same tier as "calls into a risky file") so they always get at least
+    # one LLM read pass; a file with zero function logic (pure constants/
+    # types) still correctly falls through to tier 1.
+    if facts.functions and _is_utility_path(path):
+        return 2
+
     return 1  # tier 2 (cross-file call upgrade) applied in a second pass
 
 
@@ -833,7 +870,7 @@ def main():
         calls_index.setdefault(base, []).append(path)
 
     for path, facts in all_facts.items():
-        priorities[path] = compute_priority(facts)
+        priorities[path] = compute_priority(facts, path)
     second_pass_priority(all_facts, priorities, calls_index)
 
     roles = {path: classify_role(facts, path) for path, facts in all_facts.items()}

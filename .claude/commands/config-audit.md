@@ -34,7 +34,7 @@ Walk `<repo-path>`. Collect these files:
 - `**/grafana/datasource*.yml`, `**/grafana/**/*.yml`, `**/dashboards/*.json` — Grafana datasource and dashboard configs
 - `**/tempo/*.yml`, `**/tempo/**/*.yml` — Tempo (distributed tracing) configs
 - `**/prometheus/*.yml`, `**/alertmanager/*.yml` — Prometheus and Alertmanager configs
-- `**/pyproject.toml`, `**/setup.cfg`, `**/setup.py` — Python package manifests at any depth (nested packages, workspace members)
+- `**/pyproject.toml`, `**/setup.cfg`, `**/setup.py`, `**/requirements.txt` — Python package manifests at any depth (nested packages, workspace members)
 - `**/go.mod` — Go module manifests at any depth
 
 If none found, note it in warnings and stop.
@@ -203,6 +203,28 @@ Flag CI injection as CWE-78 (command injection) at high severity.
 
 If `environment:` block hard-codes values like `SECRET_KEY: mysecret` instead of `${SECRET_KEY}`, flag as secret in version-controlled file.
 
+### 3f — Python package manifests
+
+Files: `pyproject.toml`, `requirements.txt`, `setup.cfg`, `setup.py`. This is a first-party-source-adjacent supply chain check (the manifest lives in the repo, unlike `config-audit`'s usual deployment-config scope), so it belongs here rather than in `find-vulns-python` — no application logic needs to be read, only the manifest's own declared dependency references.
+
+Checks:
+- `git+https://...@<branch>` references — a mutable branch reference, not a pinned commit SHA. Any future push to that branch is silently pulled into the next build. CWE-829.
+- `pip install git+https://...` without a trailing `@<40-char-sha>` — same issue via a different invocation path.
+- Any URL-based dependency (`@ https://...`) with no accompanying hash (`--hash=sha256:...` or a `sha256=` fragment on the URL).
+
+Flag with: exact line, the repo/URL referenced, and what a compromised upstream ref would let an attacker do (arbitrary code runs at install/import time, in CI and on every developer/production machine that installs the package).
+
+### 3g — Dockerfile CMD/ENTRYPOINT dev-mode detection
+
+For each Dockerfile, extract the `CMD` and `ENTRYPOINT` values (this is a different concern from 3b/3c above, which check build-time flags and download integrity — this checks what the container actually *runs*):
+
+- Flag commands containing: `dev`, `debug`, `--debug`, `--reload`, `--hot-reload`, `develop`, `development`
+- Flag known dev-server commands specifically: `langgraph dev`, `flask run` without `--no-debug`, `uvicorn --reload`, `nodemon`, `ts-node`, `webpack-dev-server`, `next dev`, `vite` without `--preview`
+- For any flagged command, note what the dev mode is known to enable (an unauthenticated admin API, a live-reload port, a debug console/profiler endpoint) — this is what makes it a finding, not just a style note
+- Cross-check: is this Dockerfile referenced from a production-looking compose file (`docker-compose.yml`, `docker-compose.prod.yml`)? Also check the `FROM` tag — `:latest` or unpinned suggests less deployment rigor generally, which raises confidence that dev-mode flags reached production by oversight rather than deliberate config
+
+Severity: high if a dev-mode command appears in a Dockerfile referenced by a production compose file; medium otherwise. CWE-489 (Active Debug Code).
+
 ---
 
 ## Step 3b — Analyze constants.py / defaults.py / secrets.py
@@ -332,7 +354,7 @@ Add `deployment_context` field to each config finding:
 | Class | CWE | OWASP |
 |---|---|---|
 | Security feature disabled | CWE-16 | A05:2021 |
-| Default credentials / weak secret | CWE-521 | A02:2021 |
+| Default credentials / weak secret | CWE-798 | A02:2021 |
 | Debug mode in production | CWE-94 | A05:2021 |
 | Backend port exposed bypassing proxy | CWE-284 | A01:2021 |
 | CSRF protection disabled | CWE-352 | A01:2021 |
@@ -344,6 +366,7 @@ Add `deployment_context` field to each config finding:
 | CORS wildcard + credentials | CWE-942 | A05:2021 |
 | Mock auth bypass without production guard | CWE-290 | A07:2021 |
 | Overly permissive email domain / auth scope | CWE-284 | A01:2021 |
+| Dev-mode command in Dockerfile CMD/ENTRYPOINT | CWE-489 | A05:2021 |
 
 **CVSS 3.1 scoring** — For every config finding, assign `cvss_vector` and `cvss_score`. Config findings have no attacker-controlled taint flow, so score based on what an attacker can do once they exploit the misconfiguration:
 

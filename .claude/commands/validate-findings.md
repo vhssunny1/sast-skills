@@ -88,6 +88,20 @@ Based on `fp_score`:
 | 0.51–0.74 | `needs_review` | Uncertain — include in report, flag for manual triage |
 | 0.75–1.00 | `likely_fp` | Probably false positive — exclude from default report, keep in full output |
 
+## Step 4b — Cross-service correlation
+
+`config-audit` and `find-vulns-*` run as independent steps with no shared context — a config-only finding and a code-only finding can combine into something more severe than either alone, but nothing currently checks for that. This step works entirely from fields already present in `findings.json` (evidence, description, sink, cwe, file) — it does **not** re-read source code, consistent with this skill's existing constraint.
+
+For every pair of findings in the current batch, check these specific correlations:
+
+a. **OIDC/JWT replay:** one finding's `evidence`/`description` indicates a disabled OIDC nonce check or `JWT_ALGORITHM=none` (a `CONFIG-*` finding, typically CWE-287), and another finding's `sink`/`evidence` shows a `jwt.decode()`/`jwt.verify()` call with no nonce validation (from Q9's general JWT-validation-gaps check). Individually each is High; together they form a replay-attack chain — upgrade both to Critical and add a `correlated_with` field on each pointing at the other's `id`.
+
+b. **CORS wildcard + credentialed requests:** one finding shows a CORS wildcard/reflected-origin misconfiguration (`CONFIG-*` CWE-942, or a TypeScript `Q10` finding), and another shows `credentials: 'include'` / `axios.defaults.withCredentials = true` / `XMLHttpRequest.withCredentials = true` reaching a cross-origin request. Together these mean authenticated responses are exfiltratable cross-origin, not just public data — upgrade to Critical if not already, and cross-reference via `correlated_with`.
+
+c. **Exposed port without a corresponding auth layer:** a `config-audit` finding shows a non-standard port exposed in `docker-compose.yml` with no network isolation, and no `find-vulns-*` finding for that same service's routes shows an auth check present. This one is weaker evidence (absence of a finding is not proof of absence of auth) — only flag as a `needs_review`-tier note, do not auto-escalate severity from this correlation alone.
+
+When a correlation is found, add `correlated_with: ["<other-finding-id>"]` and a `correlation_note` explaining the combined risk to both findings, and reflect any severity/CVSS change before Step 5's ranking runs. Most scans will have zero correlations — that's expected, not a sign this step did nothing.
+
 ## Step 5 — Rank findings
 
 Sort all findings with status `confirmed`, `likely_real`, or `needs_review` by:
@@ -115,6 +129,7 @@ Overwrite `findings.json` with the validated version. Add these fields to each f
 - `fp_score` — the computed false positive score
 - `validation_status` — one of: `confirmed`, `likely_real`, `needs_review`, `likely_fp`
 - `validation_notes` — array of strings explaining the score (e.g. "taint_confirmed: false adds 0.60", "cross-file path verified subtracts 0.10")
+- `correlated_with` and `correlation_note` — only present on findings Step 4b matched to another finding; absent otherwise
 
 Preserve `cpg_guided`, `cpg_source_confirmed`, and `codeql_confirmed` on every finding that has them (set by `find-vulns-*`/`codeql-scan`) — `scan-report` reads these into SARIF `result.properties`. Do not drop them just because this step doesn't otherwise reference the finding's other fields.
 
@@ -175,7 +190,7 @@ Source code fallback example (hardcoded constant — deployment context does NOT
   "validation_notes": [
     "taint_confirmed: null (config finding) → +0.20",
     "deployment_context: source_code_fallback → -0.20 (overrides template leniency)",
-    "severity Critical, CWE-521 → -0.10",
+    "severity Critical, CWE-798 → -0.10",
     "net fp_score: -0.10 → capped at 0.00 → confirmed"
   ]
 }

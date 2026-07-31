@@ -17,7 +17,7 @@ This skill turns SAST findings into targeted proof-of-concept tests — one test
 Read `findings.json`. Extract only findings with `validation_status` of `confirmed` or `likely_real`.
 
 Group them by CWE:
-- `CWE-521` — weak secret / hardcoded credential
+- `CWE-798` — weak secret / hardcoded credential
 - `CWE-918` — SSRF
 - `CWE-79` — XSS
 - `CWE-601` — open redirect
@@ -38,7 +38,7 @@ Also extract from the top-level `findings.json`:
 
 For each finding, generate a Python test function using the templates below. Name each function `test_<finding_id_lowercase>()`.
 
-### CWE-521 — Weak / hardcoded secret
+### CWE-798 — Weak / hardcoded secret
 
 **Sub-case A: Flask session secret (`SECRET_KEY`)**
 

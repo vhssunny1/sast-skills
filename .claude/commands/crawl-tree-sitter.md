@@ -90,7 +90,7 @@ crawl-tree-sitter: tree-sitter CLI not installed — AST crawl skipped.
 
 Role per file (first matching rule wins): `entry_point` (has route registrations or Next.js `pages/`/`app/`-root convention), `middleware` ((req,res,next) shape), `service`/`dao` (name suffix + call patterns), `model` (no function bodies), `component` (JSX with no routes), `config` (name pattern), else `util`.
 
-`security_priority` 1–5, driven by dangerous-pattern tier (5: eval/exec/SQLi/XSS/deserialization sinks; 4: SSRF/path-traversal/jwt-sign/weak-hash; 3: user-input sources present; 2: calls into a tier-≥3 file; 1: no risk signals). See `harness/scripts/crawl_tree_sitter.py` for the exact rules if you need to verify a specific file's score.
+`security_priority` 1–5, driven by dangerous-pattern tier (5: eval/exec/SQLi/XSS/deserialization sinks; 4: SSRF/path-traversal/jwt-sign/weak-hash; 3: user-input sources present; 2: calls into a tier-≥3 file, OR has real function logic and a utility/helper/manager/extractor/tool-pattern path — checked per path segment, e.g. `ls_manager/downloaders.py` matches on the directory name even though the filename alone doesn't; 1: no risk signals). The utility-path rule exists because such files often receive attacker-controlled data (a file path, uploaded bytes) as a plain function parameter rather than reading it directly from `req.*`/`request.*` — the only shape our user-input-source detection recognizes — so without this floor they can score tier 1 and never enter the `find-vulns-*` scan queue (which only includes `security_priority >= 2`) at all, even when reachable from a real entry point. See `harness/scripts/crawl_tree_sitter.py` for the exact rules if you need to verify a specific file's score.
 
 ## Constraints
 

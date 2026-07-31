@@ -193,6 +193,12 @@ Flag as IDOR (CWE-639) when a resource ID parameter is accepted, a DB operation 
 
 **Q5 — File handling:** Does this function construct file paths from user input? Is there a `resolve()` + `relative_to()` guard?
 
+Additional sink variants to check for, beyond simple read-path traversal:
+- `os.path.join()` where any component comes from user input, even if sanitized upstream — check whether the sanitization handles null bytes, unicode normalization, and `../` encoding variants, not just a literal `../` string match
+- `open(user_filename, 'w')` — arbitrary file **write**, not just read; often missed because path-traversal review defaults to read-only sinks
+- `shutil.copy`/`shutil.move` with a user-controlled source or destination
+- `zipfile.ZipFile.extractall()` without verifying each member's resolved path stays within the target directory (Zip Slip, CWE-22) — a crafted archive entry named e.g. `../../etc/cron.d/x` writes outside the intended extraction folder
+
 **Q6 — Security library trust model:** Does this function set up or invoke a security library (RestrictedPython, `advocate` for SSRF, `bleach` for XSS, etc.)? If yes:
 1. Look up what the library requires to provide its stated protection (e.g. RestrictedPython requires `_getattr_ = safe_getattr`, `advocate` must replace `requests` consistently).
 2. Check whether the code installs ALL the required guards — not just the obvious ones.
@@ -204,6 +210,12 @@ Flag as IDOR (CWE-639) when a resource ID parameter is accepted, a DB operation 
 **Q9 — JWT middleware authorization split:** When you find a middleware or auth layer that (a) validates a JWT and stores the payload in `request.state` or `g`, AND (b) also reads a separate header for group/role authorization — verify that BOTH reads come from the same validated source. The group/role read is dangerous if it uses `request.headers.get(...)` instead of the already-validated state object. Even if JWT validation is solid, reading groups from a separate raw header completely bypasses it.
 
 Also look for or-chain identity resolution: `resolved_email = (header_value or body.email or "")`. Any or-chain that falls back to a user-supplied body field is a bypass when the first term is absent. The fix is to use only the JWT-validated state: `request.state.user_data.get("email")`.
+
+**General JWT validation gaps** (broader than the middleware-split pattern above — check every `jwt.decode()`/`jwt.verify()` call site, not just auth middleware):
+- `jwt.decode()` called without verifying `exp`, `aud`, or `iss` claims (check the `options=` dict for `verify_exp: False` etc., or a library default that skips one of these)
+- Algorithm confusion: decoding with `algorithms=["HS256", "RS256"]` (both accepted) instead of a single explicit algorithm — allows an attacker who obtains the RS256 public key to forge an HS256-signed token using that key as the HMAC secret
+- A symmetric signing secret read from an environment variable with a weak hardcoded default (`os.environ.get("JWT_SECRET", "changeme")`)
+- Token accepted via a URL query parameter — ends up in server access logs, browser history, and referrer headers
 
 **Q8 — Defense exists but not called:** When you identify an SSRF, path traversal, open redirect, or SQL sink with no sanitization visible in the current file, scan the `files[]` list from `crawl-output.json` for utility files (`utils/`, `helpers/`, `lib/`) that contain functions named `is_safe_host`, `validate_url`, `check_host`, `allowed_redirect`, `safe_path`, `validate_scheme`, or similar. If such a function exists elsewhere in the codebase but is NOT called at the vulnerable sink:
 - Confirm the finding as real (the developer knew the risk and wrote a guard, but forgot to wire it)
@@ -244,6 +256,43 @@ Look for:
 - **Falsy size guard bypass:** `if not size: size = DEFAULT_MAX` — Python's `not` is truthy/falsy, so `size=0` (a valid user-supplied value) bypasses the guard entirely. Always use `if size is None:` for guard checks. When reviewing size guards, check whether the guard uses `if not x:` or `if x is None:` — only the latter is safe.
 
 Flag as CWE-400 (uncontrolled resource consumption) at medium severity. Sanitization: `min(user_value, SAFE_MAX)` or explicit size cap before the operation.
+
+**In-memory collections without eviction:** dicts/sets/lists used as session registries, caches, or queues where entries are added on user action but never pruned. Look for: a global dict/set at module level, `.append()`/`.update()` called per-request or per-connection, no max-size check, no TTL, no cleanup on disconnect/session-end. Flag as CWE-400 — an attacker who can trigger repeated entries (new sessions, new connections) grows the collection unboundedly.
+
+**Q13 — System-wide data access without authorization gate:** For every route/endpoint handler, distinct from Q2 (which requires a `*_id` parameter + DB op with no owner filter — this question covers system-scoped data with no resource ID to trace at all):
+
+a. Does the handler return or mutate data that spans multiple users or the entire system (logs, analytics, all-project listings, bulk deletions, admin operations)?
+b. Is there NO ownership check AND no auth decorator/dependency at the handler level? (Look for: missing `@require_auth`, missing `current_user` param, missing tenant filter in the query)
+c. Confirm: is the data returned user-scoped or system-scoped?
+
+Flag if: handler touches system-scoped data + no auth gate of any kind. Severity: High-Critical depending on data sensitivity. CWE-862 (Missing Authorization).
+
+**Q14 — Runtime binary download patterns in Python source:** Distinct from Q8 (which is about an existing guard function not being called at a sink) — this is about missing integrity verification on downloaded/executed code, which may have no guard function anywhere in the codebase to find. Scan for:
+
+a. `requests.get`/`urllib`/`httpx` downloading an executable, then writing to disk and executing it without verifying a SHA-256 or GPG signature
+b. Pattern: fetch URL → write bytes → `os.chmod(..., 0o755)` → `subprocess.run`/`os.execv`
+c. Binary files (`.whl`, `.so`, `.exe`) committed to the repository and referenced directly (check `files[]` from `crawl-output.json` for binary paths referenced in import statements or load calls)
+d. A "download manager" class pattern (e.g. a `download_asset()`-style method) with no integrity check before use
+
+Flag each: file, line range, what binary is fetched, what an attacker controlling the download source could substitute. CWE-494 (Download of Code Without Integrity Check), CWE-829 (Inclusion of Functionality from Untrusted Control Sphere).
+
+**Q15 — Mass assignment:** Does a handler pass a request body/dict directly into an ORM write with no field allowlist? Look for `Model.objects.create(**request.POST.dict())` (Django), `Model(**request.form)` / `Model(**request.get_json())` (Flask-SQLAlchemy), `for k, v in data.items(): setattr(user, k, v)`, or a DRF serializer with `fields = "__all__"` and no `read_only_fields` excluding privilege columns (`is_staff`, `is_superuser`, `role`, `balance`). Confirm the model/serializer doesn't already restrict writable fields before flagging. CWE-915, high severity when the writable field set includes anything privilege-related.
+
+**Q16 — CSRF protection absent on state-changing routes:** For POST/PUT/PATCH/DELETE views that authenticate via a session cookie (Django's default `SessionMiddleware`+cookie auth, or Flask session cookies — not a bearer-token API where the client sets `Authorization` manually), check whether CSRF protection is actually applied: Django's `@csrf_exempt` on a state-changing view, or a Flask view registered without `@csrf.protect` / `WTF_CSRF_ENABLED` context when the app uses Flask-WTF elsewhere. Flag `@csrf_exempt` on a state-changing view as CWE-352, medium-high depending on impact. (Global `CSRF_ENABLED=false` is already caught by `config-audit`'s env-file check — this question catches the code-level per-view exemption instead.)
+
+**Don't be fooled by a nearby origin/referer check that doesn't gate anything:** some handlers read `request.headers.get('Origin')`/`Referer` right next to the sensitive write and it can look like protection at a glance. Verify the check's result is actually used in a conditional that returns/raises when it fails. If the boolean is instead passed to unrelated bookkeeping (a metrics call, an internal challenge/analytics tracker) and the write below it runs unconditionally regardless of that boolean's value, there is no real protection — flag it exactly as if no check existed. Read the full surrounding function; do not stop at "a check mentioning origin/referer exists somewhere in this handler."
+
+**Q17 — Cookie and security-header hardening:** This check requires an explicit search, not incidental noticing — a file can get read for an unrelated finding (a hardcoded key, a weak hash) and a `set_cookie(...)` call nearby is easy to skip past. As a discrete sub-step, search the whole codebase for every `response.set_cookie(...)`/`HttpResponse.set_cookie(...)` call site, not just files already flagged for other reasons. For each: is it setting a session/auth/CSRF token? If so and `secure=True`, `httponly=True`, or `samesite="Lax"/"Strict"` are missing or explicitly `False` — including a call with no keyword flags at all, which is the same as all three being absent — flag as CWE-614.
+
+Separately, check the app's entry-point/middleware setup for which of these specific headers are actually configured: `Content-Security-Policy`, `Strict-Transport-Security`, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy` (via `flask-talisman`, a custom `after_request` handler, or equivalent). This is a per-header check, not all-or-nothing — an app can set some of these while still lacking CSP or HSTS entirely. Flag CWE-693 medium severity per specific header class that is absent, noting exactly which headers are covered vs missing so the fix is targeted, not a blanket "add headers" note that ignores partial coverage already in place.
+
+**Q18 — Weak cryptography and randomness (beyond Q3's password-hash check):** Does the file use `hashlib.md5()`/`hashlib.sha1()` for a token, signature, or integrity check (not a non-security checksum/cache key) — flag as CWE-327. Does `random.random()`, `random.randint()`, or `random.choice()` generate a session id, password-reset token, or API key instead of the `secrets` module (`secrets.token_urlsafe()`, `secrets.token_hex()`) — flag as CWE-330. Is an encryption key passed to `Fernet(key)` / `AES.new(key, ...)` a string literal in source rather than loaded from env/secret store — flag as CWE-321.
+
+**Q19 — Timing side-channels and user enumeration:** In a login or password-reset view, does the response differ (status code, message text) depending on whether the *account* exists vs. whether the *password* is wrong (e.g. `if not user: return 404` vs. a separate `if not check_password(): return 401`)? Both branches should return an identical generic response — flag as CWE-204/CWE-208. Separately, is a secret/token compared with `==` instead of `hmac.compare_digest()` or `secrets.compare_digest()` — flag as CWE-208 at medium severity (lower confidence than enumeration, since network-timing exploitation is harder in practice).
+
+**Q20 — Password policy and re-authentication on change:** Does the registration or password-set endpoint accept any non-empty string with no minimum length/complexity validation (no Django `AUTH_PASSWORD_VALIDATORS` equivalent check applied, or a Pydantic/marshmallow field with no length/regex constraint)? Flag as CWE-521 medium severity (distinct from CWE-916, which is about hash algorithm strength, not policy). **Check both places this validation could live, not just the route/view:** ORM-heavy apps often push field-level rules into the model layer — a SQLAlchemy/Django model's custom setter/property that hashes the password but applies no length/complexity check anywhere is just as much a missing-policy finding as an empty view function. If the view passes the raw password straight to a model create/update call with no validation on either side, trace into that model file before concluding whether policy exists. Does the password-change endpoint update the password without first verifying the current password or a fresh re-auth token? Flag as CWE-620 high severity — a hijacked session can otherwise permanently lock out the real account owner.
+
+**Q21 — Sensitive data at rest and in URL:** Does a model/ORM write store a field that should be encrypted/hashed (SSN, credit card, raw password, private API key) as plaintext with no transform applied before `.save()`/`.commit()` — flag as CWE-312. Separately, does a password, session token, or password-reset token appear as a URL path/query parameter (`request.GET.get("token")` used for a reset link, rather than a POST body) — flag as CWE-598; query strings land in server access logs, browser history, and `Referer` headers sent to third parties.
 
 ---
 
@@ -292,6 +341,18 @@ Flag as CWE-400 (uncontrolled resource consumption) at medium severity. Sanitiza
 | Zip Slip (archive path traversal) | CWE-22 | A01:2021 |
 | Symlink following | CWE-59 | A01:2021 |
 | Application-code supply chain (download without integrity check) | CWE-494 | A08:2021 |
+| Mass assignment (unrestricted field write) | CWE-915 | A08:2021 |
+| CSRF protection absent (per-view exemption) | CWE-352 | A01:2021 |
+| Cookie missing Secure/HttpOnly/SameSite | CWE-614 | A05:2021 |
+| Missing security headers | CWE-693 | A05:2021 |
+| Weak crypto algorithm (MD5/SHA1 for tokens) | CWE-327 | A02:2021 |
+| Insufficiently random token (random module) | CWE-330 | A02:2021 |
+| Hardcoded server-side crypto key | CWE-321 | A02:2021 |
+| Timing side-channel / user enumeration | CWE-204 | A07:2021 |
+| Weak password requirements | CWE-521 | A07:2021 |
+| Unverified password change | CWE-620 | A07:2021 |
+| Cleartext storage of sensitive data | CWE-312 | A02:2021 |
+| Sensitive data in query parameters | CWE-598 | A01:2021 |
 
 **CVSS 3.1 scoring** — For every finding, assign `cvss_vector` and `cvss_score`.
 
@@ -335,6 +396,15 @@ Use the reference table below to pick a starting vector, then adjust for the spe
 | Prompt injection (indirect, LLM-mediated) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N | 4.8 |
 | Information leakage — error messages | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N | 5.3 |
 | Resource exhaustion / ReDoS | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H | 7.5 |
+| Mass assignment — privilege field writable | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N | 7.7 |
+| CSRF — state-changing view, session auth | CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:N | 6.5 |
+| Cookie missing Secure/HttpOnly flag | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N | 4.3 |
+| Missing security headers | CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N | 4.7 |
+| Weak crypto / predictable token (random module) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N | 6.5 |
+| Timing side-channel / user enumeration | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N | 5.3 |
+| Weak password requirements | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N | 4.0 |
+| Unverified password change | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N | 6.8 |
+| Cleartext storage of sensitive data | CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:N/A:N | 5.5 |
 
 Adjustment examples:
 - Exploit requires admin access → PR:L → PR:H (score drops ~0.5–2.0)

@@ -186,6 +186,7 @@
         <label class="option-check"><input type="checkbox" id="opt-codeql"> Enable CodeQL</label>
         <label class="option-check"><input type="checkbox" id="opt-dast"> Generate DAST tests</label>
         <label class="option-check"><input type="checkbox" id="opt-fresh"> Force fresh (ignore resume)</label>
+        <label class="option-check"><input type="checkbox" id="opt-recheck-tier5"> Re-check tier-5 files (recover missed findings, ~$1 extra)</label>
       </div>
     </div>
 
@@ -284,6 +285,7 @@ async function startScan() {
     codeql:            document.getElementById('opt-codeql').checked,
     dast:              document.getElementById('opt-dast').checked,
     fresh:             document.getElementById('opt-fresh').checked,
+    recheck_tier5:     document.getElementById('opt-recheck-tier5').checked,
   };
 
   document.getElementById('scan-btn').disabled = true;

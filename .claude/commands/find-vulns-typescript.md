@@ -152,6 +152,7 @@ Taint propagates through: variable assignment, template literals, object spread,
 | Mapping library HTML injection | `marker.bindPopup(tainted)`, `layer.setPopupContent(tainted)`, `L.popup().setContent(tainted)` (Leaflet); `new mapboxgl.Popup().setHTML(tainted)` (Mapbox) — mapping libraries render popup content as raw HTML by default | XSS via map popup — user-supplied location names, coordinates, or metadata stored in DB and rendered in browser without sanitization |
 | CSS-as-HTML injection | `styleElement.innerHTML = userCss` where `styleElement` is a `<style>` DOM node — assigning user-controlled CSS to a style element's innerHTML allows `</style>` tag injection, which closes the style block and renders arbitrary HTML. A payload like `</style><img src=x onerror=alert(1)>` executes JavaScript. | Stored XSS — dashboard CSS, theme CSS, user-defined styles stored in DB and injected at render time |
 | Outbound response leakage (Node/Express) | `res.json({ error: err.message })` returning raw exception message; `res.set(upstreamResponse.headers)` forwarding internal service headers to client; `console.log(process.env.SECRET_KEY)` in request handler; `res.setHeader("X-Internal-Path", filePath)` leaking server file paths | Internal system information exposed to external clients — stack traces, credentials, internal hostnames |
+| Unsafe deserialization (Node) | `node-serialize`'s `unserialize(tainted)` — payloads wrapped as `"_$$ND_FUNC$$_function(){...}()"` execute as code during deserialization, not via `eval`; `serialize-to-js` / custom deserializers that `eval()` or `new Function()` the parsed string internally | Arbitrary code execution — distinct from the Code Injection sink above because the dangerous call is hidden inside a library, not written directly in this file |
 
 ### Sanitization that breaks the chain
 
@@ -250,6 +251,32 @@ Look for:
 
 Flag at medium severity. Fix: always cap loops with `Math.min(userCount, MAX_ALLOWED)` and never compile user-supplied strings as regex patterns.
 
+**Q10 — Reflected-origin CORS (Node/Express handlers):** Does a response header get set as `res.setHeader('Access-Control-Allow-Origin', req.headers.origin)` (or the equivalent via a CORS middleware configured with a function that echoes the request's `Origin` header) with no allowlist check? This differs from `config-audit`'s CORS-wildcard-in-config check — that catches a static `*` in a config file; this catches a *dynamic* reflection pattern in application code, which is broader (it lets literally any origin through, wildcard included, but a config scanner reading only static values won't see it since the actual allowed origin is computed at request time).
+
+Escalate to high severity when `Access-Control-Allow-Credentials: true` is also set alongside the reflected origin — the combination lets any origin read authenticated (cookie-bearing) responses, not just public data. CWE-942.
+
+**Q11 — Mass assignment (Node/Express handlers):** Does a handler pass a request body directly into a model write with no field allowlist? Look for `Object.assign(user, req.body)`, `Model.update(req.body, ...)`, `User.findByIdAndUpdate(id, req.body)`, `{...user, ...req.body}` spread onto a saved entity, or a Prisma/TypeORM `.update({ data: req.body })`. If the handler does not destructure or `pick()` only expected fields first, an attacker can set fields never intended to be user-writable (`isAdmin`, `role`, `balance`, `verified`).
+
+Confirm before flagging: check whether the model/schema itself restricts writable fields (e.g. Mongoose `select: false` doesn't help here, but an explicit DTO/allowlist step before the write does). Flag as CWE-915 at high severity when the writable field set includes anything privilege- or trust-related; medium otherwise.
+
+**Q12 — CSRF protection absent on state-changing routes (Node/Express):** For POST/PUT/PATCH/DELETE routes that authenticate via a session cookie (not a bearer JWT read from an `Authorization` header — bearer-token APIs are not CSRF-vulnerable since browsers don't auto-attach them), check whether CSRF protection exists anywhere in the app: `csurf`, `csrf-csrf`, `@fastify/csrf-protection`, or a custom double-submit-cookie check. If the entry-point crawl shows session-cookie auth (`express-session`, `cookie-session`) and no CSRF middleware is registered in any entry_point/middleware file, flag once per affected route group (not per-route, to avoid duplicate noise) as CWE-352, medium-high severity depending on what the route does (state change with financial/account impact → high).
+
+**Don't be fooled by a nearby origin/referer check that doesn't gate anything:** some handlers compute `req.headers.origin`/`req.headers.referer` right next to the sensitive write and it can look like protection at a glance. Verify the check's result is actually used in a conditional that returns/throws/blocks execution when it fails. If the boolean is instead passed to unrelated bookkeeping (a metrics call, an analytics/logging helper, an internal "was this exploited" tracker) and the write below it runs unconditionally regardless of that boolean's value, there is no real protection — flag it exactly as if no check existed at all. Read the full surrounding function; do not stop at "a check mentioning origin/referer exists somewhere in this handler."
+
+**Q13 — Cookie and security-header hardening:** This check requires an explicit search, not incidental noticing — a file can get read for an unrelated finding (a hardcoded key, a weak hash) and a `res.cookie(...)` call two lines away is easy to skip past. As a discrete sub-step, search the whole codebase for every `res.cookie(...)` call site (grep-equivalent: `res.cookie(`), not just the files already flagged for other reasons. For each: is it setting an auth/session/CSRF token (check what value is assigned and where that value is read back, e.g. as `req.cookies.token` used for an auth lookup)? If so and `secure`/`httpOnly`/`sameSite` are absent from the options object (or the call has no options object at all — `res.cookie('token', token)` with nothing else is the same as all three being absent), flag as CWE-614 — absent `secure` matters even in local dev code since it ships to production unchanged.
+
+Separately, check the app's entry-point/bootstrap file for which of these specific headers are actually configured (via `helmet()`, individual `helmet.xxx()` sub-calls, or manual `res.setHeader`): `Content-Security-Policy`, `Strict-Transport-Security`, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`. This is a per-header check, not all-or-nothing — an app can call `helmet.frameguard()` and `helmet.noSniff()` (covering 2 of the 5) while still having no CSP and no HSTS configured anywhere. Flag CWE-693 medium severity per specific header class that is absent, not just when zero header-hardening exists; note in the finding exactly which headers are covered vs missing so the fix is a targeted addition, not a blanket "add helmet()" suggestion that's already partially done.
+
+**Q14 — Weak cryptography and randomness:** Does the file use `crypto.createHash('md5')` or `crypto.createHash('sha1')` for anything other than a non-security checksum (cache key, ETag) — flag as CWE-327 if used for a token, signature, or integrity check. Does `Math.random()` generate a session id, password-reset token, API key, or any other value an attacker must not be able to predict — flag as CWE-330 (use `crypto.randomBytes`/`crypto.randomUUID` instead). Is a crypto key passed to `crypto.createCipheriv`/`createDecipheriv`/`createHmac` a string literal in source rather than loaded from env/secret store — flag as CWE-321 (this is distinct from Q4's client-bundle secret check; this is a server-side hardcoded key used for legitimate crypto operations).
+
+**Q15 — Timing side-channels and user enumeration:** In a login or password-reset handler, does the response (status code, message text, or timing) differ depending on whether the *account* exists vs. whether the *password* is wrong? A branch like `if (!user) return res.status(404).send("no such user")` followed by a separate `if (!match) return res.status(401).send("wrong password")` lets an attacker enumerate valid accounts (CWE-204/CWE-208) — both branches should return the same generic message and status. Separately, is a secret/token compared with `===`/`==` instead of `crypto.timingSafeEqual` — flag as a timing side-channel (CWE-208) at medium severity; this is lower-confidence than enumeration since exploiting a timing gap over a network is harder in practice.
+
+**Q16 — Password policy and re-authentication on change:** Does the registration or password-set endpoint accept any non-empty string with no minimum length/complexity check? Flag as CWE-521 at medium severity (this is registration-time policy — distinct from CWE-916, which is about hash algorithm strength). **Check both places this validation could live, not just the route handler:** many apps (especially ORM-heavy ones) push field-level rules into the model layer instead of the controller — a Sequelize/TypeORM field definition with a custom `set()`/setter that hashes the value but applies no `validate: { len: ... }` or regex check is just as much a missing-policy finding as an empty route handler. If the route handler passes the raw password straight to a model create/update call with no validation on either side, trace into that model file before concluding whether policy exists. Does the password-change endpoint update the password without first verifying the user's *current* password or a fresh re-auth token? Flag as CWE-620 at high severity — without this, a hijacked session (e.g. via XSS) can lock the real owner out permanently by changing their password.
+
+**Q17 — Sensitive data at rest and in transit paths:** Does a DB write store a field that should be encrypted/hashed (SSN, credit card, raw password, private API key) as plaintext in a model/schema with no `bcrypt`/`crypto` transform applied before the save — flag as CWE-312. Separately, does a password, session token, or password-reset token appear in a URL that is built with `req.query` or a client-side `GET`/link (rather than a request body or `Authorization` header) — flag as CWE-598; query strings land in server access logs, browser history, and `Referer` headers sent to third parties.
+
+**Q18 — Unsafe deserialization (Node):** Does the file call `unserialize()` from `node-serialize`, or any custom deserializer that reconstructs functions from a string (look for `_$$ND_FUNC$$_` markers or a deserializer that calls `eval`/`new Function` internally on parsed input) on data that originated from a request body, cookie, or query param? Flag as CWE-502 at critical severity — this is direct RCE via deserialization, not classic injection.
+
 ---
 
 ## Step 4b — Confirm CPG candidates
@@ -303,6 +330,19 @@ This ensures CPG-discovered paths that the main scan queue would have reached ev
 | Prototype pollution | CWE-1321 | A03:2021 |
 | Hardcoded credentials in client | CWE-798 | A02:2021 |
 | Sensitive data in client bundle | CWE-200 | A02:2021 |
+| Mass assignment (unrestricted field write) | CWE-915 | A08:2021 |
+| CSRF protection absent | CWE-352 | A01:2021 |
+| Cookie missing Secure flag | CWE-614 | A05:2021 |
+| Missing security headers | CWE-693 | A05:2021 |
+| Weak crypto algorithm (MD5/SHA1 for tokens) | CWE-327 | A02:2021 |
+| Insufficiently random token (Math.random) | CWE-330 | A02:2021 |
+| Hardcoded server-side crypto key | CWE-321 | A02:2021 |
+| Timing side-channel / user enumeration | CWE-204 | A07:2021 |
+| Weak password requirements | CWE-521 | A07:2021 |
+| Unverified password change | CWE-620 | A07:2021 |
+| Cleartext storage of sensitive data | CWE-312 | A02:2021 |
+| Sensitive data in query parameters | CWE-598 | A01:2021 |
+| Unsafe deserialization (node-serialize) | CWE-502 | A08:2021 |
 
 **CVSS 3.1 scoring** — For every finding, assign `cvss_vector` and `cvss_score`.
 
@@ -347,6 +387,15 @@ Use the reference table below to pick a starting vector, then adjust for the spe
 | Prompt injection (indirect, LLM-mediated) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N | 4.8 |
 | Information leakage — error messages | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N | 5.3 |
 | Password exposed in GET params | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N | 6.5 |
+| Mass assignment — privilege field writable | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N | 7.7 |
+| CSRF — state-changing route, no auth beyond session | CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:N | 6.5 |
+| Cookie missing Secure flag | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N | 4.3 |
+| Missing security headers | CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N | 4.7 |
+| Weak crypto / predictable token (Math.random) | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N | 6.5 |
+| Timing side-channel / user enumeration | CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N | 5.3 |
+| Weak password requirements | CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N | 4.0 |
+| Unverified password change | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N | 6.8 |
+| Cleartext storage of sensitive data | CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:N/A:N | 5.5 |
 
 Adjustment examples:
 - Exploit requires admin access → PR:L → PR:H (score drops ~0.5–2.0)
